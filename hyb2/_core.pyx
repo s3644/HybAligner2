@@ -23,10 +23,9 @@ for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3),(78,3),(1
     _ENCODE[c] = v
 
 cdef bytes encode_2bit_py(bytes seq):
-    """Pack ASCII DNA → 2-bit packed bytes (CPU-numpy, fast)."""
+    """Pack ASCII DNA → 2-bit packed bytes (kept for small batches)."""
     cdef int n = len(seq)
     cdef np.ndarray[np.uint8_t, ndim=1] enc = _ENCODE[bytearray(seq)]
-    # Pack 4 bases per byte: [b0 b1 b2 b3] → b0<<6 | b1<<4 | b2<<2 | b3
     cdef np.ndarray[np.uint8_t, ndim=1] packed = np.zeros((n + 3) >> 2, dtype=np.uint8)
     cdef int i
     for i in range(0, n, 4):
@@ -35,6 +34,21 @@ cdef bytes encode_2bit_py(bytes seq):
                        ((enc[i+2] if i+2 < n   else 0) << 2) | \
                        ((enc[i+3] if i+3 < n   else 0))
     return packed.tobytes()
+
+def _encode_all_vectorized(padded, n_reads, read_len):
+    """Vectorized 2-bit encoding: numpy ops over all reads at once."""
+    cdef Py_ssize_t total = <Py_ssize_t>n_reads * <Py_ssize_t>read_len
+    cdef int pad = (4 - (total % 4)) % 4
+    cdef np.ndarray[np.uint8_t, ndim=1] enc = _ENCODE[np.frombuffer(padded, dtype=np.uint8)]
+    if pad:
+        enc = np.pad(enc, (0, pad), constant_values=0)
+    cdef np.ndarray[np.uint8_t, ndim=2] enc_2d = enc.reshape(-1, 4)
+    cdef np.ndarray[np.uint32_t, ndim=1] p32 = np.zeros(enc_2d.shape[0], dtype=np.uint32)
+    p32 = (enc_2d[:,0].astype(np.uint32) << 6) | \
+          (enc_2d[:,1].astype(np.uint32) << 4) | \
+          (enc_2d[:,2].astype(np.uint32) << 2) | \
+           enc_2d[:,3].astype(np.uint32)
+    return p32.astype(np.uint8).tobytes()
 
 # ── CUDA Runtime API ───────────────────────────────────────────
 cdef extern from "cuda_runtime.h":
@@ -175,18 +189,14 @@ cdef class HybAligner2:
         n_reads = len(read_list)
         read_len = max(len(r) for r in read_list) if read_list else 0
 
-        # 2-bit encode all reads (CPU, padded to read_len)
-        cdef bytes packed
-        cdef int plen = (read_len + 3) >> 2  # packed bytes per read
-        parts = []
-        for r in read_list:
-            padded = r.ljust(read_len, b'N')[:read_len]
-            parts.append(encode_2bit_py(padded))
-        padded_packed = b''.join(parts)
+        # Vectorized 2-bit encode: pad all reads, encode in one numpy pass
+        cdef bytes padded = b''.join(r.ljust(read_len, b'N')[:read_len] for r in read_list)
+        padded_packed = _encode_all_vectorized(padded, n_reads, read_len)
+        cdef int plen = ((<Py_ssize_t>n_reads * <Py_ssize_t>read_len + 3) >> 2)  # packed bytes total
 
         # ── Upload packed reads to GPU ─────────────────────
-        cudaMalloc(<void**>&d_reads, n_reads * plen)
-        cudaMemcpy(d_reads, <const unsigned char*>padded_packed, n_reads * plen, cudaMemcpyHostToDevice)
+        cudaMalloc(<void**>&d_reads, plen)
+        cudaMemcpy(d_reads, <const unsigned char*>padded_packed, plen, cudaMemcpyHostToDevice)
 
         # ── Phase 1: GPU seed reads (single best anchor) ──
         rp_arr = np.full(n_reads, -1, dtype=np.int32)
