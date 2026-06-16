@@ -2,34 +2,34 @@
 from setuptools import setup, Extension
 from Cython.Build import cythonize
 import numpy as np
-import os
-import subprocess
+import os, subprocess
 
-# Compile CUDA kernels to object file
+# Compile CUDA kernels → object file
 cuda_src = "hyb2/kernels.cu"
 cuda_obj = "hyb2/kernels.o"
 
 subprocess.run([
     "nvcc", "-c", cuda_src, "-o", cuda_obj,
-    "-O3", "-arch=sm_120",  # GB10 Blackwell
+    "-O3", "-arch=sm_120",
     "-Xcompiler", "-fPIC",
 ], check=True)
 
 ext = Extension(
     "hyb2._core",
     sources=["hyb2/_core.pyx"],
-    extra_objects=[cuda_obj],
-    include_dirs=[np.get_include(), "/usr/local/cuda/include"],
-    library_dirs=["/usr/local/cuda/lib64"],
-    libraries=["cudart"],
-    extra_compile_args=["-O3"],
+    extra_objects=[cuda_obj, "/usr/local/cuda/lib64/libcudart_static.a"],
+    include_dirs=[np.get_include(), "/usr/local/cuda/include", "."],
+    libraries=["cuda", "dl", "pthread", "rt"],
+    extra_compile_args=["-O3", "-Wno-unused-variable"],
+    extra_link_args=["-Wl,-rpath,/usr/local/cuda/lib64"],
     language="c++",
 )
 
 setup(
     name="hyb2",
-    version="2.0.0",
-    ext_modules=cythonize([ext], compiler_directives={"language_level": "3"}),
-    packages=["hyb2"],
-    package_data={"hyb2": ["kernels.cu"]},
+    version="2.0.1",
+    ext_modules=cythonize(
+        [ext],
+        compiler_directives={"language_level": "3"},
+    ),
 )
