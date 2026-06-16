@@ -1,23 +1,20 @@
-/* kernels.cu — HybAligner2 GPU kernels.
+/* kernels.cu — HybAligner2 GPU kernels (Phase 2: 2-bit packed DNA).
  *
- * Pipeline: build_index → seed_reads → (CPU chains anchors) → sw_align
+ * Pipeline: build_index → seed_reads → (CPU chains) → sw_align
  * GPU: GB10 Blackwell sm_120, 228KB shared mem per SM, CUDA 13.x.
- * Recurrence: banded Smith-Waterman-Gotoh (affine gap), double-buffered.
+ * DNA encoding: 2 bits/base (A=00,C=01,G=10,T=11), 4 bases/byte.
  */
 
 #include <cuda_runtime.h>
+#include <stdint.h>
 
 typedef unsigned long long u64;
 
-/* ── DNA helpers ────────────────────────────────────────────── */
-__device__ __forceinline__ int base2idx(char c) {
-    switch (c) {
-        case 'A': case 'a': return 0;
-        case 'C': case 'c': return 1;
-        case 'G': case 'g': return 2;
-        case 'T': case 't': return 3;
-        default:             return 4;
-    }
+/* ── 2-bit DNA helpers ──────────────────────────────────────── */
+__device__ __forceinline__ int get_base(const uint8_t* p, int pos) {
+    int byte = pos >> 2;           /* pos / 4 */
+    int shift = 6 - ((pos & 3) << 1); /* 6 - 2*(pos%4): bits 6,4,2,0 */
+    return (p[byte] >> shift) & 3;
 }
 
 __constant__ int SCORE[5][5] = {
@@ -25,58 +22,104 @@ __constant__ int SCORE[5][5] = {
     {-3,-1,-3, 2,-1}, {-1,-1,-1,-1,-1},
 };
 
-/* ── Minimizer hashing ──────────────────────────────────────── */
-__device__ u64 kmer_hash(const char* s, int p, int k) {
-    u64 f=0,r=0;
-    for(int i=0;i<k;i++){unsigned char b=base2idx(s[p+i]);f=(f<<2)|b;r=(r>>2)|((u64)(3-b)<<(2*(k-1)));}
-    return f<r?f:r;
-}
-__device__ u64 rehash(u64 k,int a){k=(~k)+(a<<21);k^=(k>>24);k=(k+(k<<3))+(k<<8);k^=(k>>14);k=(k+(k<<2))+(k<<4);k^=(k>>28);k+=(k<<31);return k;}
-
-/* ── Kernel 1: Build minimizer hash table from reference ────── */
-__global__ void build_index(const char* ref,int rl,int k,int w,u64* tk,int* tv,int ts,int mv){
-    int tid=blockIdx.x*blockDim.x+threadIdx.x,nw=rl-k-w+2;
-    if(tid>=nw/w)return;
-    int win=tid*w;u64 mh=~0ULL;int mp=-1;
-    for(int o=0;o<w&&win+o+k<=rl;o++){u64 h=kmer_hash(ref,win+o,k);if(h<mh){mh=h;mp=win+o;}}
-    if(mp<0)return;
-    for(int a=0;a<32;a++){u64 p=(a==0)?mh:rehash(mh,a);unsigned s=p%ts;
-        u64 old=atomicCAS(&tk[s],0xFFFFFFFFFFFFFFFFULL,mh);
-        if(old==0xFFFFFFFFFFFFFFFFULL||old==mh){int b=s*mv;for(int v=0;v<mv;v++){if(atomicCAS(&tv[b+v],-1,mp)==-1)break;}return;}
+/* ── Minimizer hashing (2-bit packed) ───────────────────────── */
+__device__ u64 kmer_hash_2bit(const uint8_t* s, int p, int k) {
+    u64 f = 0, r = 0;
+    for (int i = 0; i < k; i++) {
+        int b = get_base(s, p + i);
+        f = (f << 2) | b;
+        r = (r >> 2) | ((u64)(3 - b) << (2 * (k - 1)));
     }
+    return f < r ? f : r;
 }
 
-/* ── Kernel 2: Seed reads against hash table ────────────────── */
-__global__ void seed_reads(const char* reads,int nr,int rl,const u64* tk,const int* tv,int ts,int mv,int k,int w,int* orp,int* ofp){
-    int rid=blockIdx.x*blockDim.x+threadIdx.x;
-    if(rid>=nr){orp[rid]=-1;ofp[rid]=-1;return;}
-    const char* s=reads+rid*rl;int nw=rl-k-w+2;orp[rid]=-1;ofp[rid]=-1;
-    if(nw<=0)return;
-    for(int win=0;win<nw;win+=w){u64 mh=~0ULL;int mp=-1;
-        for(int o=0;o<w&&win+o+k<=rl;o++){u64 h=kmer_hash(s,win+o,k);if(h<mh){mh=h;mp=win+o;}}
-        if(mp<0)continue;
-        for(int a=0;a<32;a++){u64 p=(a==0)?mh:rehash(mh,a);unsigned s2=p%ts;
-            if(tk[s2]==mh){orp[rid]=mp;ofp[rid]=tv[s2*mv];return;}
-            if(tk[s2]==0xFFFFFFFFFFFFFFFFULL)break;
+__device__ u64 rehash(u64 k, int a) {
+    k = (~k) + (a << 21); k ^= (k >> 24);
+    k = (k + (k << 3)) + (k << 8); k ^= (k >> 14);
+    k = (k + (k << 2)) + (k << 4); k ^= (k >> 28);
+    k += (k << 31); return k;
+}
+
+/* ── Kernel 1: Build minimizer hash table (2-bit packed ref) ── */
+__global__ void build_index(
+    const uint8_t* ref, int rl, int k, int w,
+    u64* tk, int* tv, int ts, int mv)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int nw = rl - k - w + 2;
+    if (tid >= nw / w) return;
+    int win = tid * w;
+    u64 mh = ~0ULL; int mp = -1;
+    for (int o = 0; o < w && win + o + k <= rl; o++) {
+        u64 h = kmer_hash_2bit(ref, win + o, k);
+        if (h < mh) { mh = h; mp = win + o; }
+    }
+    if (mp < 0) return;
+    for (int a = 0; a < 32; a++) {
+        u64 p = (a == 0) ? mh : rehash(mh, a);
+        unsigned s = p % ts;
+        u64 old = atomicCAS(&tk[s], 0xFFFFFFFFFFFFFFFFULL, mh);
+        if (old == 0xFFFFFFFFFFFFFFFFULL || old == mh) {
+            int b = s * mv;
+            for (int v = 0; v < mv; v++)
+                if (atomicCAS(&tv[b + v], -1, mp) == -1) break;
+            return;
         }
     }
 }
 
-/* ── Kernel 3: Banded Smith-Waterman-Gotoh with anchor windowing
- * Double-buffered: prev_M/Ix/Iy + curr_M/Ix/Iy = 6 × band ints/thread.
- * Threads/block auto-capped to fit GB10 228KB shared memory. ─── */
+/* ── Kernel 2: Seed reads (2-bit packed) ────────────────────── */
+__global__ void seed_reads(
+    const uint8_t* reads, int nr, int rl,
+    const u64* tk, const int* tv, int ts, int mv,
+    int k, int w, int* orp, int* ofp)
+{
+    int rid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (rid >= nr) { orp[rid] = -1; ofp[rid] = -1; return; }
+    const uint8_t* s = reads + rid * ((rl + 3) >> 2);
+    int nw = rl - k - w + 2;
+    orp[rid] = -1; ofp[rid] = -1;
+    if (nw <= 0) return;
+    for (int win = 0; win < nw; win += w) {
+        u64 mh = ~0ULL; int mp = -1;
+        for (int o = 0; o < w && win + o + k <= rl; o++) {
+            u64 h = kmer_hash_2bit(s, win + o, k);
+            if (h < mh) { mh = h; mp = win + o; }
+        }
+        if (mp < 0) continue;
+        for (int a = 0; a < 32; a++) {
+            u64 p = (a == 0) ? mh : rehash(mh, a);
+            unsigned s2 = p % ts;
+            if (tk[s2] == mh) { orp[rid] = mp; ofp[rid] = tv[s2 * mv]; return; }
+            if (tk[s2] == 0xFFFFFFFFFFFFFFFFULL) break;
+        }
+    }
+}
+
+/* ── Kernel 3: Banded SW-Gotoh (2-bit packed, anchor windowed)
+ *
+ * Double-buffered: prev_M/Ix/Iy + curr_M/Ix/Iy = 6 × band × 4 bytes/thread.
+ * Threads auto-capped to fit 48KB dynamic shared memory.
+ * ────────────────────────────────────────────────────────────── */
 __global__ void sw_align(
-    const char* __restrict__ reads, const char* __restrict__ ref, int ref_len,
-    const int* __restrict__ anchor_rp, const int* __restrict__ anchor_fp,
+    const uint8_t* __restrict__ reads,
+    const uint8_t* __restrict__ ref,
+    int ref_len,
+    const int* __restrict__ anchor_rp,
+    const int* __restrict__ anchor_fp,
     int n_reads, int read_len,
     int band_width, int gap_open, int gap_extend,
     float* __restrict__ scores,
-    int* __restrict__ read_start, int* __restrict__ read_end,
-    int* __restrict__ ref_start, int* __restrict__ ref_end)
+    int* __restrict__ read_start,
+    int* __restrict__ read_end,
+    int* __restrict__ ref_start,
+    int* __restrict__ ref_end)
 {
     int rid = blockIdx.x * blockDim.x + threadIdx.x;
     if (rid >= n_reads) return;
-    const char* read = reads + rid * read_len;
+
+    int rl_bytes = (read_len + 3) >> 2;
+    const uint8_t* read = reads + rid * rl_bytes;
     int band = 2 * band_width + 1;
 
     extern __shared__ int sh[];
@@ -103,7 +146,7 @@ __global__ void sw_align(
     int best = 0, best_i = 0, best_j = 0;
 
     for (int i = 0; i < read_len; i++) {
-        int rc = base2idx(read[i]);
+        int rc = get_base(read, i);
         int js = rws + i - band_width, je = rws + i + band_width;
         if (js < rws) js = rws;
         if (je >= rwe) je = rwe - 1;
@@ -115,7 +158,7 @@ __global__ void sw_align(
         /* Pass 1: M and Ix */
         for (int jj = js; jj <= je; jj++) {
             int k = jj - (rws + i) + band_width;
-            int s = SCORE[rc][base2idx(ref[jj])];
+            int s = SCORE[rc][get_base(ref, jj)];
             int diag = prev_M[k];
             if (prev_Ix[k] > diag) diag = prev_Ix[k];
             if (prev_Iy[k] > diag) diag = prev_Iy[k];
@@ -144,7 +187,7 @@ __global__ void sw_align(
             int k = jj - (rws + i) + band_width;
             if (curr_M[k] > best) { best = curr_M[k]; best_i = i; best_j = jj; }
         }
-        /* Swap prev ↔ curr */
+        /* Swap */
         int* tmp;
         tmp = prev_M;  prev_M  = curr_M;  curr_M  = tmp;
         tmp = prev_Ix; prev_Ix = curr_Ix; curr_Ix = tmp;
@@ -163,25 +206,39 @@ __global__ void sw_align(
 /* ── C-callable launchers ───────────────────────────────────── */
 extern "C" {
 
-int launch_build_index(const char* ref,int rl,int k,int w,u64* tk,int* tv,int ts,int mv){
-    int nw=rl-k-w+2,blocks=(nw/w+255)/256;
-    if(blocks<=0)return-1;
-    build_index<<<blocks,256>>>(ref,rl,k,w,tk,tv,ts,mv);
+int launch_build_index(
+    const uint8_t* ref, int rl, int k, int w,
+    u64* tk, int* tv, int ts, int mv)
+{
+    int nw = rl - k - w + 2;
+    int blocks = (nw / w + 255) / 256;
+    if (blocks <= 0) return -1;
+    build_index<<<blocks, 256>>>(ref, rl, k, w, tk, tv, ts, mv);
     cudaDeviceSynchronize();
-    return cudaGetLastError()==cudaSuccess?0:-1;
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
-int launch_seed_reads(const char* reads,int nr,int rl,const u64* tk,const int* tv,int ts,int mv,int k,int w,int* orp,int* ofp){
-    int blocks=(nr+255)/256;
-    if(blocks<=0)return-1;
-    seed_reads<<<blocks,256>>>(reads,nr,rl,tk,tv,ts,mv,k,w,orp,ofp);
+
+int launch_seed_reads(
+    const uint8_t* reads, int nr, int rl,
+    const u64* tk, const int* tv, int ts, int mv,
+    int k, int w, int* orp, int* ofp)
+{
+    int blocks = (nr + 255) / 256;
+    if (blocks <= 0) return -1;
+    seed_reads<<<blocks, 256>>>(reads, nr, rl, tk, tv, ts, mv, k, w, orp, ofp);
     cudaDeviceSynchronize();
-    return cudaGetLastError()==cudaSuccess?0:-1;
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
-int launch_sw_align(const char* reads,const char* ref,int ref_len,const int* anchor_rp,const int* anchor_fp,int n_reads,int read_len,int band_width,int gap_open,int gap_extend,float* scores,int* rs,int* re,int* fs,int* fe){
-    int band=2*band_width+1;
-    int shmem_per_thread=6*band*(int)sizeof(int);
-    /* Cap: use at most 48KB dynamic shmem (safe for all sm_120 configs).
-     * If this isn't enough threads, reduce band_width at call site. */
+
+int launch_sw_align(
+    const uint8_t* reads, const uint8_t* ref, int ref_len,
+    const int* anchor_rp, const int* anchor_fp,
+    int n_reads, int read_len,
+    int band_width, int gap_open, int gap_extend,
+    float* scores, int* rs, int* re, int* fs, int* fe)
+{
+    int band = 2 * band_width + 1;
+    int shmem_per_thread = 6 * band * (int)sizeof(int);
     int max_shmem = 48 * 1024;
     int max_threads = max_shmem / shmem_per_thread;
     if (max_threads < 1) max_threads = 1;
@@ -189,11 +246,14 @@ int launch_sw_align(const char* reads,const char* ref,int ref_len,const int* anc
     if (threads > 256) threads = 256;
     if (threads < 1)   threads = 1;
     int shmem = threads * shmem_per_thread;
-    cudaFuncSetAttribute(sw_align,cudaFuncAttributeMaxDynamicSharedMemorySize,shmem);
-    int blocks=(n_reads+threads-1)/threads;
-    sw_align<<<blocks,threads,shmem>>>(reads,ref,ref_len,anchor_rp,anchor_fp,n_reads,read_len,band_width,gap_open,gap_extend,scores,rs,re,fs,fe);
+    cudaFuncSetAttribute(sw_align, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
+    int blocks = (n_reads + threads - 1) / threads;
+    sw_align<<<blocks, threads, shmem>>>(
+        reads, ref, ref_len, anchor_rp, anchor_fp,
+        n_reads, read_len, band_width, gap_open, gap_extend,
+        scores, rs, re, fs, fe);
     cudaDeviceSynchronize();
-    return cudaGetLastError()==cudaSuccess?0:-1;
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
 } /* extern "C" */

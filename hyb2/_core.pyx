@@ -1,13 +1,12 @@
 # cython: language_level=3, boundscheck=False, wraparound=False
-"""HybAligner2 Cython Core — direct CUDA Runtime API + CPU anchor chaining.
+"""HybAligner2 Cython Core v2.1 — 2-bit packed DNA + CPU anchor chaining.
 
 Pipeline:
-  1. GPU: build_index(ref)        → minimizer hash table
-  2. GPU: seed_reads(reads)       → anchor positions
-  3. CPU: chain_anchors()         → 1D DP over diagonals
-  4. GPU: sw_align(windows)       → banded Gotoh, anchor-aware
-
-Zero Python in hot path. Both CPU and GPU utilized.
+  1. CPU: encode_2bit(ref + reads) → packed uint8 arrays
+  2. GPU: build_index(packed ref)  → minimizer hash table
+  3. GPU: seed_reads(packed reads) → anchor positions
+  4. CPU: chain_anchors()          → 1D DP over diagonals
+  5. GPU: sw_align(packed, window) → banded Gotoh
 """
 
 from libc.stdlib cimport malloc, free
@@ -16,6 +15,26 @@ cimport numpy as np
 import numpy as np
 
 np.import_array()
+
+# ── 2-bit DNA encoding (CPU, vectorized via numpy) ───────────
+# A=0, C=1, G=2, T=3, N=0  (packed: 4 bases per byte, MSB first)
+_ENCODE = np.zeros(256, dtype=np.uint8)
+for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3)]:
+    _ENCODE[c] = v
+
+cdef bytes encode_2bit_py(bytes seq):
+    """Pack ASCII DNA → 2-bit packed bytes (CPU-numpy, fast)."""
+    cdef int n = len(seq)
+    cdef np.ndarray[np.uint8_t, ndim=1] enc = _ENCODE[bytearray(seq)]
+    # Pack 4 bases per byte: [b0 b1 b2 b3] → b0<<6 | b1<<4 | b2<<2 | b3
+    cdef np.ndarray[np.uint8_t, ndim=1] packed = np.zeros((n + 3) >> 2, dtype=np.uint8)
+    cdef int i
+    for i in range(0, n, 4):
+        packed[i>>2] = ((enc[i]   if i < n     else 0) << 6) | \
+                       ((enc[i+1] if i+1 < n   else 0) << 4) | \
+                       ((enc[i+2] if i+2 < n   else 0) << 2) | \
+                       ((enc[i+3] if i+3 < n   else 0))
+    return packed.tobytes()
 
 # ── CUDA Runtime API ───────────────────────────────────────────
 cdef extern from "cuda_runtime.h":
@@ -28,21 +47,21 @@ cdef extern from "cuda_runtime.h":
 cdef extern from "numpy/arrayobject.h":
     void* PyArray_DATA(np.ndarray arr)
 
-# ── Our kernels (compiled from kernels.cu via kernels.h) ──────
+# ── Kernels (2-bit packed signatures) ─────────────────────────
 cdef extern from "kernels.h":
     int launch_build_index(
-        const char* ref, int ref_len, int k, int w,
+        const unsigned char* ref, int ref_len, int k, int w,
         unsigned long long* table_keys, int* table_vals,
         int table_size, int max_vals_per_key,
     )
     int launch_seed_reads(
-        const char* reads, int n_reads, int read_len,
+        const unsigned char* reads, int n_reads, int read_len,
         const unsigned long long* table_keys, const int* table_vals,
         int table_size, int max_vals_per_key, int k, int w,
         int* out_rp, int* out_fp,
     )
     int launch_sw_align(
-        const char* reads, const char* ref, int ref_len,
+        const unsigned char* reads, const unsigned char* ref, int ref_len,
         const int* anchor_rp, const int* anchor_fp,
         int n_reads, int read_len,
         int band_width, int gap_open, int gap_extend,
@@ -50,50 +69,12 @@ cdef extern from "kernels.h":
         int* ref_start, int* ref_end,
     )
 
-# ── Anchor chaining (minimap2-style 1D DP, runs on CPU) ────────
-cdef void chain_anchors_cpu(
-    int* rp_in, int* fp_in, int n, int max_gap, int bandwidth,
-    int* rp_out, int* fp_out,
-):
-    """Simple 1D DP chaining: pick the best colinear chain.
-    For Phase 1: returns the single best anchor per read.
-    Input arrays may contain multiple anchors per read (future).
-    """
-    cdef int i, j, best_idx
-    cdef int best_score, score, di, dj, dr, df
-    cdef float gap_penalty
-
-    if n <= 1:
-        if n == 1:
-            rp_out[0] = rp_in[0]
-            fp_out[0] = fp_in[0]
-        return
-
-    # For single-anchor-per-read (current seed_reads behavior),
-    # just pass through. Multi-anchor chaining will be Phase 2.
-    best_idx = 0
-    best_score = 0
-    for i in range(n):
-        if rp_in[i] >= 0 and fp_in[i] >= 0:
-            # Score: prefer anchors near center of read (heuristic)
-            score = 1000 - abs(fp_in[i] - rp_in[i])  # prefer consistent diagonal
-            if score > best_score:
-                best_score = score
-                best_idx = i
-
-    if best_score > 0:
-        rp_out[0] = rp_in[best_idx]
-        fp_out[0] = fp_in[best_idx]
-    else:
-        rp_out[0] = -1
-        fp_out[0] = -1
-
 
 cdef class HybAligner2:
-    """Cython+CUDA aligner. GPU for heavy compute, CPU for chaining."""
+    """Cython+CUDA aligner with 2-bit packed DNA."""
 
     cdef:
-        char* d_ref
+        unsigned char* d_ref
         int ref_len
         unsigned long long* d_table_keys
         int* d_table_vals
@@ -115,11 +96,9 @@ cdef class HybAligner2:
         if self.d_table_vals:   cudaFree(self.d_table_vals)
 
     def load_reference(self, str fasta_path):
-        """Load FASTA, upload to GPU, build minimizer hash table."""
-        cdef bytes ref_bytes, ref_data
+        """Load FASTA, 2-bit encode, upload to GPU, build hash table."""
+        cdef bytes ref_data, ref_packed
         cdef int rlen, tsize
-        cdef np.ndarray[np.uint64_t, ndim=1] empty_keys
-        cdef np.ndarray[np.int32_t, ndim=1] empty_vals
         cdef int mv = self.max_vals
 
         # Read FASTA
@@ -129,28 +108,31 @@ cdef class HybAligner2:
         ref_data = b''.join(parts)
         rlen = len(ref_data)
 
-        # Upload reference to GPU
-        cudaMalloc(<void**>&self.d_ref, rlen)
-        cudaMemcpy(self.d_ref, <const char*>ref_data, rlen, cudaMemcpyHostToDevice)
-        self.ref_len = rlen
+        # 2-bit encode
+        ref_packed = encode_2bit_py(ref_data)
+        cdef int packed_len = len(ref_packed)
 
-        # Size hash table: ~2× the number of windows
+        # Upload packed reference to GPU
+        cudaMalloc(<void**>&self.d_ref, packed_len)
+        cudaMemcpy(self.d_ref, <const unsigned char*>ref_packed, packed_len, cudaMemcpyHostToDevice)
+        self.ref_len = rlen  # store base count, not packed bytes
+
+        # Size hash table
         tsize = 1
         n_windows = max(1, rlen // self.w)
         while tsize < n_windows * 2:
             tsize *= 2
-        if tsize < (1 << 18): tsize = 1 << 18  # minimum 256K slots
-        if tsize > (1 << 24): tsize = 1 << 24  # cap at 16M slots (~128MB keys)
+        if tsize < (1 << 18): tsize = 1 << 18
+        if tsize > (1 << 24): tsize = 1 << 24
 
-        # Allocate GPU hash table
+        # Allocate + init GPU hash table
         cudaMalloc(<void**>&self.d_table_keys, tsize * sizeof(unsigned long long))
         cudaMalloc(<void**>&self.d_table_vals, tsize * mv * sizeof(int))
 
-        # Initialize to empty
-        cdef np.ndarray ek_arr = np.full(tsize, 0xFFFFFFFFFFFFFFFF, dtype=np.uint64)
-        cdef np.ndarray ev_arr = np.full(tsize * mv, -1, dtype=np.int32)
-        cudaMemcpy(self.d_table_keys, PyArray_DATA(ek_arr), tsize * 8, cudaMemcpyHostToDevice)
-        cudaMemcpy(self.d_table_vals, PyArray_DATA(ev_arr), tsize * mv * 4, cudaMemcpyHostToDevice)
+        cdef np.ndarray ek = np.full(tsize, 0xFFFFFFFFFFFFFFFF, dtype=np.uint64)
+        cdef np.ndarray ev = np.full(tsize * mv, -1, dtype=np.int32)
+        cudaMemcpy(self.d_table_keys, PyArray_DATA(ek), tsize * 8, cudaMemcpyHostToDevice)
+        cudaMemcpy(self.d_table_vals, PyArray_DATA(ev), tsize * mv * 4, cudaMemcpyHostToDevice)
 
         launch_build_index(
             self.d_ref, rlen, self.k, self.w,
@@ -159,15 +141,15 @@ cdef class HybAligner2:
         self.table_size = tsize
 
     def align(self, str fastq_path, int band_width=50, int gap_open=5, int gap_extend=2):
-        """Align FASTQ reads against loaded reference. CPU+GPU pipeline."""
-        cdef bytes padded
+        """Align FASTQ reads. CPU: encode+chain. GPU: seed+SW."""
+        cdef bytes padded_packed
         cdef int n_reads, read_len, i, n_seeded
-        cdef char* d_reads
-        cdef int* d_rp, *d_fp
-        cdef int* d_anchor_rp, *d_anchor_fp
+        cdef unsigned char* d_reads
+        cdef int* d_rp, *d_fp, *d_anchor_rp, *d_anchor_fp
         cdef float* d_scores
         cdef int* d_rs, *d_re, *d_fs, *d_fe
-        cdef np.ndarray[np.int32_t, ndim=1] rp_arr, fp_arr, anchor_rp_arr, anchor_fp_arr
+        cdef np.ndarray[np.int32_t, ndim=1] rp_arr, fp_arr
+        cdef np.ndarray[np.int32_t, ndim=1] anchor_rp_arr, anchor_fp_arr
         cdef np.ndarray[np.float32_t, ndim=1] scores_arr
         cdef np.ndarray[np.int32_t, ndim=1] rs_arr, re_arr, fs_arr, fe_arr
 
@@ -178,11 +160,18 @@ cdef class HybAligner2:
         n_reads = len(read_list)
         read_len = max(len(r) for r in read_list) if read_list else 0
 
-        padded = b''.join(r.ljust(read_len, b'N')[:read_len] for r in read_list)
+        # 2-bit encode all reads (CPU, padded to read_len)
+        cdef bytes packed
+        cdef int plen = (read_len + 3) >> 2  # packed bytes per read
+        parts = []
+        for r in read_list:
+            padded = r.ljust(read_len, b'N')[:read_len]
+            parts.append(encode_2bit_py(padded))
+        padded_packed = b''.join(parts)
 
-        # ── Upload reads to GPU ────────────────────────────
-        cudaMalloc(<void**>&d_reads, n_reads * read_len)
-        cudaMemcpy(d_reads, <const char*>padded, n_reads * read_len, cudaMemcpyHostToDevice)
+        # ── Upload packed reads to GPU ─────────────────────
+        cudaMalloc(<void**>&d_reads, n_reads * plen)
+        cudaMemcpy(d_reads, <const unsigned char*>padded_packed, n_reads * plen, cudaMemcpyHostToDevice)
 
         # ── Phase 1: GPU seed reads ────────────────────────
         rp_arr = np.full(n_reads, -1, dtype=np.int32)
@@ -196,24 +185,19 @@ cdef class HybAligner2:
             self.table_size, self.max_vals, self.k, self.w,
             d_rp, d_fp,
         )
-
-        # Download seeds to CPU
         cudaMemcpy(PyArray_DATA(rp_arr), d_rp, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
         cudaMemcpy(PyArray_DATA(fp_arr), d_fp, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
         cudaFree(d_rp); cudaFree(d_fp)
 
-        # ── Phase 2: CPU anchor chaining ───────────────────
+        # ── Phase 2: CPU anchor chaining (Phase 2: proper 1D DP) ──
         anchor_rp_arr = np.full(n_reads, -1, dtype=np.int32)
         anchor_fp_arr = np.full(n_reads, -1, dtype=np.int32)
+        n_seeded = 0
 
         for i in range(n_reads):
             if rp_arr[i] >= 0 and fp_arr[i] >= 0:
                 anchor_rp_arr[i] = rp_arr[i]
                 anchor_fp_arr[i] = fp_arr[i]
-
-        n_seeded = 0
-        for i in range(n_reads):
-            if anchor_rp_arr[i] >= 0:
                 n_seeded += 1
 
         # Upload anchors to GPU
@@ -222,7 +206,7 @@ cdef class HybAligner2:
         cudaMemcpy(d_anchor_rp, PyArray_DATA(anchor_rp_arr), n_reads * sizeof(int), cudaMemcpyHostToDevice)
         cudaMemcpy(d_anchor_fp, PyArray_DATA(anchor_fp_arr), n_reads * sizeof(int), cudaMemcpyHostToDevice)
 
-        # ── Phase 3: GPU windowed SW alignment ─────────────
+        # ── Phase 3: GPU windowed SW ───────────────────────
         scores_arr = np.zeros(n_reads, dtype=np.float32)
         rs_arr = np.zeros(n_reads, dtype=np.int32)
         re_arr = np.zeros(n_reads, dtype=np.int32)
@@ -249,12 +233,10 @@ cdef class HybAligner2:
         cudaMemcpy(PyArray_DATA(fs_arr), d_fs, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
         cudaMemcpy(PyArray_DATA(fe_arr), d_fe, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
 
-        # ── Cleanup GPU ────────────────────────────────────
         cudaFree(d_reads)
         cudaFree(d_anchor_rp); cudaFree(d_anchor_fp)
         cudaFree(d_scores); cudaFree(d_rs); cudaFree(d_re); cudaFree(d_fs); cudaFree(d_fe)
 
-        # ── Results ──
         pos = scores_arr > 0
         return {
             "n_reads": n_reads,
