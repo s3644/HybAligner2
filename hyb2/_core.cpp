@@ -3377,10 +3377,10 @@ typedef struct {
   __Pyx_CachedCFunction __pyx_umethod_PyDict_Type_items;
   __Pyx_CachedCFunction __pyx_umethod_PyDict_Type_pop;
   __Pyx_CachedCFunction __pyx_umethod_PyDict_Type_values;
-  PyObject *__pyx_tuple[12];
+  PyObject *__pyx_tuple[14];
   PyObject *__pyx_codeobj_tab[5];
   PyObject *__pyx_string_tab[141];
-  PyObject *__pyx_number_tab[18];
+  PyObject *__pyx_number_tab[20];
 /* #### Code section: module_state_contents ### */
 
 #if CYTHON_USE_FREELISTS
@@ -3586,13 +3586,15 @@ static __pyx_mstatetype * const __pyx_mstate_global = &__pyx_mstate_global_stati
 #define __pyx_int_65 __pyx_number_tab[8]
 #define __pyx_int_67 __pyx_number_tab[9]
 #define __pyx_int_71 __pyx_number_tab[10]
-#define __pyx_int_84 __pyx_number_tab[11]
-#define __pyx_int_97 __pyx_number_tab[12]
-#define __pyx_int_99 __pyx_number_tab[13]
-#define __pyx_int_103 __pyx_number_tab[14]
-#define __pyx_int_116 __pyx_number_tab[15]
-#define __pyx_int_256 __pyx_number_tab[16]
-#define __pyx_int_0xffffffffffffffff __pyx_number_tab[17]
+#define __pyx_int_78 __pyx_number_tab[11]
+#define __pyx_int_84 __pyx_number_tab[12]
+#define __pyx_int_97 __pyx_number_tab[13]
+#define __pyx_int_99 __pyx_number_tab[14]
+#define __pyx_int_103 __pyx_number_tab[15]
+#define __pyx_int_110 __pyx_number_tab[16]
+#define __pyx_int_116 __pyx_number_tab[17]
+#define __pyx_int_256 __pyx_number_tab[18]
+#define __pyx_int_0xffffffffffffffff __pyx_number_tab[19]
 /* #### Code section: module_state_clear ### */
 #if CYTHON_USE_MODULE_STATE
 static CYTHON_SMALL_CODE int __pyx_m_clear(PyObject *m) {
@@ -3627,10 +3629,10 @@ static CYTHON_SMALL_CODE int __pyx_m_clear(PyObject *m) {
   Py_CLEAR(clear_module_state->__pyx_type_4hyb2_5_core_HybAligner2);
   Py_CLEAR(clear_module_state->__pyx_ptype_4hyb2_5_core___pyx_scope_struct__genexpr);
   Py_CLEAR(clear_module_state->__pyx_type_4hyb2_5_core___pyx_scope_struct__genexpr);
-  for (int i=0; i<12; ++i) { Py_CLEAR(clear_module_state->__pyx_tuple[i]); }
+  for (int i=0; i<14; ++i) { Py_CLEAR(clear_module_state->__pyx_tuple[i]); }
   for (int i=0; i<5; ++i) { Py_CLEAR(clear_module_state->__pyx_codeobj_tab[i]); }
   for (int i=0; i<141; ++i) { Py_CLEAR(clear_module_state->__pyx_string_tab[i]); }
-  for (int i=0; i<18; ++i) { Py_CLEAR(clear_module_state->__pyx_number_tab[i]); }
+  for (int i=0; i<20; ++i) { Py_CLEAR(clear_module_state->__pyx_number_tab[i]); }
 /* #### Code section: module_state_clear_contents ### */
 /* CommonTypesMetaclass.module_state_clear */
 Py_CLEAR(clear_module_state->__pyx_CommonTypesMetaclassType);
@@ -3676,10 +3678,10 @@ static CYTHON_SMALL_CODE int __pyx_m_traverse(PyObject *m, visitproc visit, void
   Py_VISIT(traverse_module_state->__pyx_type_4hyb2_5_core_HybAligner2);
   Py_VISIT(traverse_module_state->__pyx_ptype_4hyb2_5_core___pyx_scope_struct__genexpr);
   Py_VISIT(traverse_module_state->__pyx_type_4hyb2_5_core___pyx_scope_struct__genexpr);
-  for (int i=0; i<12; ++i) { __Pyx_VISIT_CONST(traverse_module_state->__pyx_tuple[i]); }
+  for (int i=0; i<14; ++i) { __Pyx_VISIT_CONST(traverse_module_state->__pyx_tuple[i]); }
   for (int i=0; i<5; ++i) { __Pyx_VISIT_CONST(traverse_module_state->__pyx_codeobj_tab[i]); }
   for (int i=0; i<141; ++i) { __Pyx_VISIT_CONST(traverse_module_state->__pyx_string_tab[i]); }
-  for (int i=0; i<18; ++i) { __Pyx_VISIT_CONST(traverse_module_state->__pyx_number_tab[i]); }
+  for (int i=0; i<20; ++i) { __Pyx_VISIT_CONST(traverse_module_state->__pyx_number_tab[i]); }
 /* #### Code section: module_state_traverse_contents ### */
 /* CommonTypesMetaclass.module_state_traverse */
 Py_VISIT(traverse_module_state->__pyx_CommonTypesMetaclassType);
@@ -9823,9 +9825,9 @@ __Pyx_RefNannySetupContext("PyInit__core", 0);
 
   /* "hyb2/_core.pyx":21
  * #  2-bit DNA encoding (CPU, vectorized via numpy)
- * # A=0, C=1, G=2, T=3, N=0  (packed: 4 bases per byte, MSB first)
+ * # A=0, C=1, G=2, T=3, N=3  (NT avoids false A-matches in N-blocks)
  * _ENCODE = np.zeros(256, dtype=np.uint8)             # <<<<<<<<<<<<<<
- * for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3)]:
+ * for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3),(78,3),(110,3)]:
  *     _ENCODE[c] = v
 */
   __pyx_t_4 = NULL;
@@ -9857,16 +9859,16 @@ __Pyx_RefNannySetupContext("PyInit__core", 0);
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
 
   /* "hyb2/_core.pyx":22
- * # A=0, C=1, G=2, T=3, N=0  (packed: 4 bases per byte, MSB first)
+ * # A=0, C=1, G=2, T=3, N=3  (NT avoids false A-matches in N-blocks)
  * _ENCODE = np.zeros(256, dtype=np.uint8)
- * for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3)]:             # <<<<<<<<<<<<<<
+ * for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3),(78,3),(110,3)]:             # <<<<<<<<<<<<<<
  *     _ENCODE[c] = v
  * 
 */
-  __pyx_t_2 = __pyx_mstate_global->__pyx_tuple[9]; __Pyx_INCREF(__pyx_t_2);
+  __pyx_t_2 = __pyx_mstate_global->__pyx_tuple[11]; __Pyx_INCREF(__pyx_t_2);
   __pyx_t_9 = 0;
   for (;;) {
-    if (__pyx_t_9 >= 8) break;
+    if (__pyx_t_9 >= 10) break;
     #if CYTHON_ASSUME_SAFE_MACROS && !CYTHON_AVOID_BORROWED_REFS
     __pyx_t_6 = __Pyx_NewRef(PyTuple_GET_ITEM(__pyx_t_2, __pyx_t_9));
     #else
@@ -9905,7 +9907,7 @@ __Pyx_RefNannySetupContext("PyInit__core", 0);
 
     /* "hyb2/_core.pyx":23
  * _ENCODE = np.zeros(256, dtype=np.uint8)
- * for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3)]:
+ * for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3),(78,3),(110,3)]:
  *     _ENCODE[c] = v             # <<<<<<<<<<<<<<
  * 
  * cdef bytes encode_2bit_py(bytes seq):
@@ -9922,9 +9924,9 @@ __Pyx_RefNannySetupContext("PyInit__core", 0);
     __Pyx_DECREF(__pyx_t_6); __pyx_t_6 = 0;
 
     /* "hyb2/_core.pyx":22
- * # A=0, C=1, G=2, T=3, N=0  (packed: 4 bases per byte, MSB first)
+ * # A=0, C=1, G=2, T=3, N=3  (NT avoids false A-matches in N-blocks)
  * _ENCODE = np.zeros(256, dtype=np.uint8)
- * for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3)]:             # <<<<<<<<<<<<<<
+ * for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3),(78,3),(110,3)]:             # <<<<<<<<<<<<<<
  *     _ENCODE[c] = v
  * 
 */
@@ -9943,7 +9945,7 @@ __Pyx_RefNannySetupContext("PyInit__core", 0);
   #if CYTHON_COMPILING_IN_CPYTHON && PY_VERSION_HEX >= 0x030E0000
   PyUnstable_Object_EnableDeferredRefcount(__pyx_t_2);
   #endif
-  __Pyx_CyFunction_SetDefaultsTuple(__pyx_t_2, __pyx_mstate_global->__pyx_tuple[10]);
+  __Pyx_CyFunction_SetDefaultsTuple(__pyx_t_2, __pyx_mstate_global->__pyx_tuple[12]);
   if (__Pyx_SetItemOnTypeDict(__pyx_mstate_global->__pyx_ptype_4hyb2_5_core_HybAligner2, __pyx_mstate_global->__pyx_n_u_load_reference, __pyx_t_2) < (0)) __PYX_ERR(0, 98, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
 
@@ -9959,7 +9961,7 @@ __Pyx_RefNannySetupContext("PyInit__core", 0);
   #if CYTHON_COMPILING_IN_CPYTHON && PY_VERSION_HEX >= 0x030E0000
   PyUnstable_Object_EnableDeferredRefcount(__pyx_t_2);
   #endif
-  __Pyx_CyFunction_SetDefaultsTuple(__pyx_t_2, __pyx_mstate_global->__pyx_tuple[11]);
+  __Pyx_CyFunction_SetDefaultsTuple(__pyx_t_2, __pyx_mstate_global->__pyx_tuple[13]);
   if (__Pyx_SetItemOnTypeDict(__pyx_mstate_global->__pyx_ptype_4hyb2_5_core_HybAligner2, __pyx_mstate_global->__pyx_n_u_align, __pyx_t_2) < (0)) __PYX_ERR(0, 158, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
 
@@ -10073,9 +10075,9 @@ static int __Pyx_InitCachedConstants(__pyx_mstatetype *__pyx_mstate) {
   __Pyx_GIVEREF(__pyx_mstate_global->__pyx_tuple[0]);
 
   /* "hyb2/_core.pyx":22
- * # A=0, C=1, G=2, T=3, N=0  (packed: 4 bases per byte, MSB first)
+ * # A=0, C=1, G=2, T=3, N=3  (NT avoids false A-matches in N-blocks)
  * _ENCODE = np.zeros(256, dtype=np.uint8)
- * for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3)]:             # <<<<<<<<<<<<<<
+ * for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3),(78,3),(110,3)]:             # <<<<<<<<<<<<<<
  *     _ENCODE[c] = v
  * 
 */
@@ -10103,9 +10105,15 @@ static int __Pyx_InitCachedConstants(__pyx_mstatetype *__pyx_mstate) {
   __pyx_mstate_global->__pyx_tuple[8] = PyTuple_Pack(2, __pyx_mstate_global->__pyx_int_116, __pyx_mstate_global->__pyx_int_3); if (unlikely(!__pyx_mstate_global->__pyx_tuple[8])) __PYX_ERR(0, 22, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_mstate_global->__pyx_tuple[8]);
   __Pyx_GIVEREF(__pyx_mstate_global->__pyx_tuple[8]);
-  __pyx_mstate_global->__pyx_tuple[9] = PyTuple_Pack(8, __pyx_mstate_global->__pyx_tuple[1], __pyx_mstate_global->__pyx_tuple[2], __pyx_mstate_global->__pyx_tuple[3], __pyx_mstate_global->__pyx_tuple[4], __pyx_mstate_global->__pyx_tuple[5], __pyx_mstate_global->__pyx_tuple[6], __pyx_mstate_global->__pyx_tuple[7], __pyx_mstate_global->__pyx_tuple[8]); if (unlikely(!__pyx_mstate_global->__pyx_tuple[9])) __PYX_ERR(0, 22, __pyx_L1_error)
+  __pyx_mstate_global->__pyx_tuple[9] = PyTuple_Pack(2, __pyx_mstate_global->__pyx_int_78, __pyx_mstate_global->__pyx_int_3); if (unlikely(!__pyx_mstate_global->__pyx_tuple[9])) __PYX_ERR(0, 22, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_mstate_global->__pyx_tuple[9]);
   __Pyx_GIVEREF(__pyx_mstate_global->__pyx_tuple[9]);
+  __pyx_mstate_global->__pyx_tuple[10] = PyTuple_Pack(2, __pyx_mstate_global->__pyx_int_110, __pyx_mstate_global->__pyx_int_3); if (unlikely(!__pyx_mstate_global->__pyx_tuple[10])) __PYX_ERR(0, 22, __pyx_L1_error)
+  __Pyx_GOTREF(__pyx_mstate_global->__pyx_tuple[10]);
+  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_tuple[10]);
+  __pyx_mstate_global->__pyx_tuple[11] = PyTuple_Pack(10, __pyx_mstate_global->__pyx_tuple[1], __pyx_mstate_global->__pyx_tuple[2], __pyx_mstate_global->__pyx_tuple[3], __pyx_mstate_global->__pyx_tuple[4], __pyx_mstate_global->__pyx_tuple[5], __pyx_mstate_global->__pyx_tuple[6], __pyx_mstate_global->__pyx_tuple[7], __pyx_mstate_global->__pyx_tuple[8], __pyx_mstate_global->__pyx_tuple[9], __pyx_mstate_global->__pyx_tuple[10]); if (unlikely(!__pyx_mstate_global->__pyx_tuple[11])) __PYX_ERR(0, 22, __pyx_L1_error)
+  __Pyx_GOTREF(__pyx_mstate_global->__pyx_tuple[11]);
+  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_tuple[11]);
 
   /* "hyb2/_core.pyx":98
  *         if self.d_table_vals:   cudaFree(self.d_table_vals)
@@ -10114,9 +10122,9 @@ static int __Pyx_InitCachedConstants(__pyx_mstatetype *__pyx_mstate) {
  *         """Load FASTA, 2-bit encode, upload to GPU, build hash table.
  * 
 */
-  __pyx_mstate_global->__pyx_tuple[10] = PyTuple_Pack(2, __pyx_mstate_global->__pyx_int_0, __pyx_mstate_global->__pyx_int_0); if (unlikely(!__pyx_mstate_global->__pyx_tuple[10])) __PYX_ERR(0, 98, __pyx_L1_error)
-  __Pyx_GOTREF(__pyx_mstate_global->__pyx_tuple[10]);
-  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_tuple[10]);
+  __pyx_mstate_global->__pyx_tuple[12] = PyTuple_Pack(2, __pyx_mstate_global->__pyx_int_0, __pyx_mstate_global->__pyx_int_0); if (unlikely(!__pyx_mstate_global->__pyx_tuple[12])) __PYX_ERR(0, 98, __pyx_L1_error)
+  __Pyx_GOTREF(__pyx_mstate_global->__pyx_tuple[12]);
+  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_tuple[12]);
 
   /* "hyb2/_core.pyx":158
  *         self.table_size = tsize
@@ -10125,13 +10133,13 @@ static int __Pyx_InitCachedConstants(__pyx_mstatetype *__pyx_mstate) {
  *         """Align FASTQ reads. CPU: encode+chain. GPU: seed+SW."""
  *         cdef bytes padded_packed
 */
-  __pyx_mstate_global->__pyx_tuple[11] = PyTuple_Pack(3, __pyx_mstate_global->__pyx_int_50, __pyx_mstate_global->__pyx_int_5, __pyx_mstate_global->__pyx_int_2); if (unlikely(!__pyx_mstate_global->__pyx_tuple[11])) __PYX_ERR(0, 158, __pyx_L1_error)
-  __Pyx_GOTREF(__pyx_mstate_global->__pyx_tuple[11]);
-  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_tuple[11]);
+  __pyx_mstate_global->__pyx_tuple[13] = PyTuple_Pack(3, __pyx_mstate_global->__pyx_int_50, __pyx_mstate_global->__pyx_int_5, __pyx_mstate_global->__pyx_int_2); if (unlikely(!__pyx_mstate_global->__pyx_tuple[13])) __PYX_ERR(0, 158, __pyx_L1_error)
+  __Pyx_GOTREF(__pyx_mstate_global->__pyx_tuple[13]);
+  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_tuple[13]);
   #if CYTHON_IMMORTAL_CONSTANTS
   {
     PyObject **table = __pyx_mstate->__pyx_tuple;
-    for (Py_ssize_t i=0; i<12; ++i) {
+    for (Py_ssize_t i=0; i<14; ++i) {
       #if CYTHON_COMPILING_IN_CPYTHON_FREETHREADING
       #if PY_VERSION_HEX < 0x030E0000
       if (_Py_IsOwnedByCurrentThread(table[i]) && Py_REFCNT(table[i]) == 1)
@@ -10239,15 +10247,15 @@ const char* const bytes = "Note that Cython is deliberately stricter than PEP-48
   }
   {
     PyObject **numbertab = __pyx_mstate->__pyx_number_tab + 1;
-    int8_t const cint_constants_1[] = {0,-1,1,2,3,5,50,65,67,71,84,97,99,103,116};
+    int8_t const cint_constants_1[] = {0,-1,1,2,3,5,50,65,67,71,78,84,97,99,103,110,116};
     int16_t const cint_constants_2[] = {256};
-    for (int i = 0; i < 16; i++) {
-      numbertab[i] = PyLong_FromLong((i < 15 ? cint_constants_1[i - 0] : cint_constants_2[i - 15]));
+    for (int i = 0; i < 18; i++) {
+      numbertab[i] = PyLong_FromLong((i < 17 ? cint_constants_1[i - 0] : cint_constants_2[i - 17]));
       if (unlikely(!numbertab[i])) __PYX_ERR(0, 1, __pyx_L1_error)
     }
   }
   {
-    PyObject **numbertab = __pyx_mstate->__pyx_number_tab + 17;
+    PyObject **numbertab = __pyx_mstate->__pyx_number_tab + 19;
     const char* c_constant = "fvvvvvvvvvvvv";
     for (int i = 0; i < 1; i++) {
       char *end_pos;
@@ -10259,7 +10267,7 @@ const char* const bytes = "Note that Cython is deliberately stricter than PEP-48
   #if CYTHON_IMMORTAL_CONSTANTS
   {
     PyObject **table = __pyx_mstate->__pyx_number_tab;
-    for (Py_ssize_t i=0; i<18; ++i) {
+    for (Py_ssize_t i=0; i<20; ++i) {
       #if CYTHON_COMPILING_IN_CPYTHON_FREETHREADING
       #if PY_VERSION_HEX < 0x030E0000
       if (_Py_IsOwnedByCurrentThread(table[i]) && Py_REFCNT(table[i]) == 1)

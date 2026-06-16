@@ -17,9 +17,9 @@ import numpy as np
 np.import_array()
 
 # ── 2-bit DNA encoding (CPU, vectorized via numpy) ───────────
-# A=0, C=1, G=2, T=3, N=0  (packed: 4 bases per byte, MSB first)
+# A=0, C=1, G=2, T=3, N=3  (N→T avoids false A-matches in N-blocks)
 _ENCODE = np.zeros(256, dtype=np.uint8)
-for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3)]:
+for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3),(78,3),(110,3)]:
     _ENCODE[c] = v
 
 cdef bytes encode_2bit_py(bytes seq):
