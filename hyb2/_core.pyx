@@ -95,11 +95,22 @@ cdef class HybAligner2:
         if self.d_table_keys:   cudaFree(self.d_table_keys)
         if self.d_table_vals:   cudaFree(self.d_table_vals)
 
-    def load_reference(self, str fasta_path):
-        """Load FASTA, 2-bit encode, upload to GPU, build hash table."""
+    def load_reference(self, str fasta_path, int k=0, int w=0):
+        """Load FASTA, 2-bit encode, upload to GPU, build hash table.
+        
+        Args:
+            k: k-mer size (default: 10 for good specificity, min 8)
+            w: window size for minimizer (default: k//2 + 1)
+        """
         cdef bytes ref_data, ref_packed
         cdef int rlen, tsize
         cdef int mv = self.max_vals
+
+        # Set k, w (configurable)
+        if k <= 0: k = 10  # default: better specificity than k=8
+        if w <= 0: w = max(5, k // 2 + 1)
+        self.k = k
+        self.w = w
 
         # Read FASTA
         with open(fasta_path, 'rb') as f:
@@ -113,9 +124,13 @@ cdef class HybAligner2:
         cdef int packed_len = len(ref_packed)
 
         # Upload packed reference to GPU
+        if self.d_ref: cudaFree(self.d_ref)
+        if self.d_table_keys: cudaFree(self.d_table_keys)
+        if self.d_table_vals: cudaFree(self.d_table_vals)
+
         cudaMalloc(<void**>&self.d_ref, packed_len)
         cudaMemcpy(self.d_ref, <const unsigned char*>ref_packed, packed_len, cudaMemcpyHostToDevice)
-        self.ref_len = rlen  # store base count, not packed bytes
+        self.ref_len = rlen
 
         # Size hash table
         tsize = 1

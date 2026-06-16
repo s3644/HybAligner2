@@ -10,22 +10,24 @@ def main():
     p = argparse.ArgumentParser(description="HybAligner2 — CPU+GPU aligner")
     p.add_argument("fastq", help="Input FASTQ")
     p.add_argument("ref", help="Reference FASTA")
-    p.add_argument("-b", "--band", type=int, default=50, help="Band width (auto-capped by GPU shmem)")
+    p.add_argument("-b", "--band", type=int, default=20, help="Band width (auto-capped by GPU shmem)")
+    p.add_argument("-k", "--kmer", type=int, default=10, help="K-mer size (8-15, higher=more specific)")
+    p.add_argument("-w", "--window", type=int, default=0, help="Minimizer window (auto: k//2+1)")
     p.add_argument("--go", type=int, default=5, help="Gap open penalty")
     p.add_argument("--ge", type=int, default=2, help="Gap extend penalty")
     p.add_argument("-q", "--quiet", action="store_true")
     args = p.parse_args()
 
     if not args.quiet:
-        print(f"HybAligner2 v2.0.1 — CPU+GPU hybrid")
+        print(f"HybAligner2 v2.2 — CPU+GPU hybrid")
         print(f"  FASTQ: {args.fastq}")
         print(f"  Ref:   {args.ref}")
-        print(f"  Band:  ±{args.band}  Gap: {args.go}/{args.ge}")
+        print(f"  Band:  ±{args.band}  K-mer: {args.kmer}  W: {args.window or args.kmer//2+1}  Gap: {args.go}/{args.ge}")
 
     aln = HybAligner2()
 
     t0 = time.perf_counter()
-    aln.load_reference(args.ref)
+    aln.load_reference(args.ref, k=args.kmer, w=args.window)
     load_ms = (time.perf_counter() - t0) * 1000
     if not args.quiet:
         print(f"  Index: {load_ms:.0f}ms")
