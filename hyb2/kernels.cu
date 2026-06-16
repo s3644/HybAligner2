@@ -118,11 +118,14 @@ __global__ void sw_align_local(
     int curr_M[161], curr_Ix[161], curr_Iy[161];
 
     int ar = anchor_rp[rid], af = anchor_fp[rid];
-    int rws;
-    if (ar >= 0 && af >= 0) {
-        rws = af - ar - band_width;
-        if (rws < 0) rws = 0; if (rws >= ref_len) rws = ref_len - 1;
-    } else { rws = 0; }
+    if (ar < 0 || af < 0) {
+        scores[rid] = 0.0f;
+        read_start[rid] = read_len; read_end[rid] = 0;
+        ref_start[rid] = ref_len; ref_end[rid] = 0;
+        return;
+    }
+    int rws = af - ar - band_width;
+    if (rws < 0) rws = 0; if (rws >= ref_len) rws = ref_len - 1;
     int rwe = rws + read_len + band;
     if (rwe > ref_len) rwe = ref_len;
 
