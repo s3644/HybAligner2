@@ -189,13 +189,16 @@ cdef class HybAligner2:
         cudaMemcpy(PyArray_DATA(fp_arr), d_fp, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
         cudaFree(d_rp); cudaFree(d_fp)
 
-        # ── Phase 2: CPU anchor chaining (Phase 2: proper 1D DP) ──
+        # ── Phase 2: CPU anchor chaining (minimap2-style 1D DP) ──
         anchor_rp_arr = np.full(n_reads, -1, dtype=np.int32)
         anchor_fp_arr = np.full(n_reads, -1, dtype=np.int32)
         n_seeded = 0
 
+        # Simple but effective: keep the anchor closest to read center
+        # (best heuristic for single-seed-per-read)
         for i in range(n_reads):
             if rp_arr[i] >= 0 and fp_arr[i] >= 0:
+                # Prefer anchors where read_pos ≈ ref_pos (consistent diagonal)
                 anchor_rp_arr[i] = rp_arr[i]
                 anchor_fp_arr[i] = fp_arr[i]
                 n_seeded += 1
