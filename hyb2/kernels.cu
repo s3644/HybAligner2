@@ -97,48 +97,31 @@ __global__ void seed_reads(
     }
 }
 
-/* ── Kernel 3: Banded SW-Gotoh (2-bit packed, anchor windowed)
- *
- * Double-buffered: prev_M/Ix/Iy + curr_M/Ix/Iy = 6 × band × 4 bytes/thread.
- * Threads auto-capped to fit 48KB dynamic shared memory.
- * ────────────────────────────────────────────────────────────── */
-__global__ void sw_align(
+__global__ void sw_align_local(
     const uint8_t* __restrict__ reads,
-    const uint8_t* __restrict__ ref,
-    int ref_len,
-    const int* __restrict__ anchor_rp,
-    const int* __restrict__ anchor_fp,
+    const uint8_t* __restrict__ ref, int ref_len,
+    const int* __restrict__ anchor_rp, const int* __restrict__ anchor_fp,
     int n_reads, int read_len,
     int band_width, int gap_open, int gap_extend,
     float* __restrict__ scores,
-    int* __restrict__ read_start,
-    int* __restrict__ read_end,
-    int* __restrict__ ref_start,
-    int* __restrict__ ref_end)
+    int* __restrict__ read_start, int* __restrict__ read_end,
+    int* __restrict__ ref_start, int* __restrict__ ref_end)
 {
     int rid = blockIdx.x * blockDim.x + threadIdx.x;
     if (rid >= n_reads) return;
-
     int rl_bytes = (read_len + 3) >> 2;
     const uint8_t* read = reads + rid * rl_bytes;
-    int band = 2 * band_width + 1;
+    int band = 2 * band_width + 1;  /* max 161 for bw<=80 */
 
-    extern __shared__ int sh[];
-    int* my = sh + threadIdx.x * (6 * band);
-    int* prev_M  = my;
-    int* prev_Ix = prev_M  + band;
-    int* prev_Iy = prev_Ix + band;
-    int* curr_M  = prev_Iy + band;
-    int* curr_Ix = curr_M  + band;
-    int* curr_Iy = curr_Ix + band;
+    /* Fixed-size local arrays (L1-cached, no shmem limit) */
+    int prev_M[161], prev_Ix[161], prev_Iy[161];
+    int curr_M[161], curr_Ix[161], curr_Iy[161];
 
-    /* Reference window from anchor */
     int ar = anchor_rp[rid], af = anchor_fp[rid];
     int rws;
     if (ar >= 0 && af >= 0) {
         rws = af - ar - band_width;
-        if (rws < 0) rws = 0;
-        if (rws >= ref_len) rws = ref_len - 1;
+        if (rws < 0) rws = 0; if (rws >= ref_len) rws = ref_len - 1;
     } else { rws = 0; }
     int rwe = rws + read_len + band;
     if (rwe > ref_len) rwe = ref_len;
@@ -149,59 +132,37 @@ __global__ void sw_align(
     for (int i = 0; i < read_len; i++) {
         int rc = get_base(read, i);
         int js = rws + i - band_width, je = rws + i + band_width;
-        if (js < rws) js = rws;
-        if (je >= rwe) je = rwe - 1;
-
+        if (js < rws) js = rws; if (je >= rwe) je = rwe - 1;
+        for (int jj = js; jj <= je; jj++)
+            curr_M[jj-(rws+i)+band_width] = curr_Ix[jj-(rws+i)+band_width] = curr_Iy[jj-(rws+i)+band_width] = 0;
         for (int jj = js; jj <= je; jj++) {
-            int k = jj - (rws + i) + band_width;
-            curr_M[k] = curr_Ix[k] = curr_Iy[k] = 0;
-        }
-        /* Pass 1: M and Ix */
-        for (int jj = js; jj <= je; jj++) {
-            int k = jj - (rws + i) + band_width;
-            int s = SCORE[rc][get_base(ref, jj)];
-            int diag = prev_M[k];
-            if (prev_Ix[k] > diag) diag = prev_Ix[k];
-            if (prev_Iy[k] > diag) diag = prev_Iy[k];
-            curr_M[k] = (diag + s > 0) ? diag + s : 0;
+            int k = jj-(rws+i)+band_width, s = SCORE[rc][get_base(ref,jj)];
+            int diag = prev_M[k]; if (prev_Ix[k]>diag) diag=prev_Ix[k]; if (prev_Iy[k]>diag) diag=prev_Iy[k];
+            curr_M[k] = (diag+s>0)?diag+s:0;
             int ix = 0;
-            if (k + 1 < band) {
-                int fm = prev_M[k+1] - gap_open - gap_extend;
-                int fi = prev_Ix[k+1] - gap_extend;
-                ix = (fm > fi) ? fm : fi;
-            }
-            curr_Ix[k] = (ix > 0) ? ix : 0;
+            if (k+1<band) { int fm=prev_M[k+1]-gap_open-gap_extend, fi=prev_Ix[k+1]-gap_extend; ix=(fm>fi)?fm:fi; }
+            curr_Ix[k] = (ix>0)?ix:0;
         }
-        /* Pass 2: Iy */
         for (int jj = js; jj <= je; jj++) {
-            int k = jj - (rws + i) + band_width;
-            int iy = 0;
-            if (k > 0) {
-                int fm = curr_M[k-1] - gap_open - gap_extend;
-                int fi = curr_Iy[k-1] - gap_extend;
-                iy = (fm > fi) ? fm : fi;
-            }
-            curr_Iy[k] = (iy > 0) ? iy : 0;
+            int k = jj-(rws+i)+band_width, iy = 0;
+            if (k>0) { int fm=curr_M[k-1]-gap_open-gap_extend, fi=curr_Iy[k-1]-gap_extend; iy=(fm>fi)?fm:fi; }
+            curr_Iy[k] = (iy>0)?iy:0;
         }
-        /* Track best */
         for (int jj = js; jj <= je; jj++) {
-            int k = jj - (rws + i) + band_width;
-            if (curr_M[k] > best) { best = curr_M[k]; best_i = i; best_j = jj; }
+            int k = jj-(rws+i)+band_width;
+            if (curr_M[k]>best) { best=curr_M[k]; best_i=i; best_j=jj; }
         }
-        /* Swap */
-        int* tmp;
-        tmp = prev_M;  prev_M  = curr_M;  curr_M  = tmp;
-        tmp = prev_Ix; prev_Ix = curr_Ix; curr_Ix = tmp;
-        tmp = prev_Iy; prev_Iy = curr_Iy; curr_Iy = tmp;
+        for (int k = 0; k < band; k++) {
+            int t = prev_M[k]; prev_M[k]=curr_M[k]; curr_M[k]=t;
+            t = prev_Ix[k]; prev_Ix[k]=curr_Ix[k]; curr_Ix[k]=t;
+            t = prev_Iy[k]; prev_Iy[k]=curr_Iy[k]; curr_Iy[k]=t;
+        }
     }
-
-    scores[rid] = (float)best;
-    read_start[rid] = (best > 0) ? 0 : read_len;
-    read_end[rid]   = (best > 0) ? read_len : 0;
-    ref_start[rid]  = (best > 0) ? (best_j - best_i) : ref_len;
-    ref_end[rid]    = (best > 0) ? (best_j - best_i + read_len) : 0;
-    if (ref_start[rid] < 0) ref_start[rid] = 0;
-    if (ref_end[rid] > ref_len) ref_end[rid] = ref_len;
+    scores[rid]=(float)best;
+    read_start[rid]=(best>0)?0:read_len; read_end[rid]=(best>0)?read_len:0;
+    ref_start[rid]=(best>0)?(best_j-best_i):ref_len;
+    ref_end[rid]=(best>0)?(best_j-best_i+read_len):0;
+    if(ref_start[rid]<0)ref_start[rid]=0; if(ref_end[rid]>ref_len)ref_end[rid]=ref_len;
 }
 
 /* ── C-callable launchers ───────────────────────────────────── */
@@ -238,18 +199,9 @@ int launch_sw_align(
     int band_width, int gap_open, int gap_extend,
     float* scores, int* rs, int* re, int* fs, int* fe)
 {
-    int band = 2 * band_width + 1;
-    int shmem_per_thread = 6 * band * (int)sizeof(int);
-    int max_shmem = 48 * 1024;
-    int max_threads = max_shmem / shmem_per_thread;
-    if (max_threads < 1) max_threads = 1;
-    int threads = max_threads;
-    if (threads > 256) threads = 256;
-    if (threads < 1)   threads = 1;
-    int shmem = threads * shmem_per_thread;
-    cudaFuncSetAttribute(sw_align, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
+    int threads = 256;
     int blocks = (n_reads + threads - 1) / threads;
-    sw_align<<<blocks, threads, shmem>>>(
+    sw_align_local<<<blocks, threads>>>(
         reads, ref, ref_len, anchor_rp, anchor_fp,
         n_reads, read_len, band_width, gap_open, gap_extend,
         scores, rs, re, fs, fe);
