@@ -68,11 +68,12 @@ __global__ void build_index(
     }
 }
 
-/* ── Kernel 2: Seed reads (2-bit packed) ────────────────────── */
+/* ── Kernel 2: Seed reads (2-bit packed, single best anchor) ── */
 __global__ void seed_reads(
     const uint8_t* reads, int nr, int rl,
     const u64* tk, const int* tv, int ts, int mv,
-    int k, int w, int* orp, int* ofp)
+    int k, int w,
+    int* orp, int* ofp)
 {
     int rid = blockIdx.x * blockDim.x + threadIdx.x;
     if (rid >= nr) { orp[rid] = -1; ofp[rid] = -1; return; }
