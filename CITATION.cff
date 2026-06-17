@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use HybAligner2 in your research, please cite this repository."
+authors:
+  - family-names: "s3644"
+    given-names: ""
+    email: "jukrapope@gmail.com"
+    orcid: ""
+title: "HybAligner2: GPU-accelerated DNA sequence aligner (Cython + CUDA)"
+version: 2.1.0
+date-released: 2026-06-17
+repository-code: "https://github.com/s3644/HybAligner2"
+license: "MIT"
+type: software
+keywords:
+  - "DNA sequence alignment"
+  - "GPU computing"
+  - "CUDA"
+  - "Smith-Waterman"
+  - "bioinformatics"
+  - "Cython"

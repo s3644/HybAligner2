@@ -168,6 +168,25 @@ See [`GAP_ANALYSIS.md`](./GAP_ANALYSIS.md) for detailed performance analysis.
 
 ---
 
+## Citation
+
+If you use HybAligner2 in your research, please cite:
+
+```bibtex
+@software{hybaligner2_2026,
+  author    = {s3644},
+  title     = {{HybAligner2}: {GPU}-accelerated {DNA} sequence aligner},
+  version   = {2.1.0},
+  year      = {2026},
+  month     = {6},
+  url       = {https://github.com/s3644/HybAligner2},
+}
+```
+
+See [`CITATION.cff`](./CITATION.cff) for the machine-readable citation metadata.
+
+---
+
 ## License
 
 MIT — see LICENSE file.
