@@ -23,37 +23,41 @@ cdef unsigned char _ENC_C[256]
 for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3),(78,3),(110,3)]:
     _ENC_C[c] = v
 
-cdef bytes pad_and_encode_c(list read_list, int n_reads, int read_len):
-    """C-level: pre-allocate N-buffer, copy reads, 2-bit encode. No Python in hot loop."""
+cdef bytes pad_and_encode_stream(str fastq_path, int n_reads, int read_len):
+    """Stream FASTQ → pad + 2-bit encode in ONE pass. No intermediate list.
+    Eliminates: 6GB read(), split(b'\\n'), 24M-item list extraction."""
     cdef Py_ssize_t total = <Py_ssize_t>n_reads * <Py_ssize_t>read_len
     cdef Py_ssize_t packed_total = (total + 3) >> 2
-    cdef Py_ssize_t i, j, st
-    cdef int rlen, pos
     cdef unsigned char* buf = <unsigned char*>malloc(total)
     cdef unsigned char* packed = <unsigned char*>malloc(packed_total)
-    cdef unsigned char* src
-    cdef bytes rbytes
     cdef unsigned char b0, b1, b2, b3
+    cdef int pos = 0, st = 0, rlen, i, reads_copied
+    cdef Py_ssize_t line_num
+    cdef bytes seq
 
     if buf == NULL or packed == NULL:
         free(buf); free(packed)
         raise MemoryError("malloc failed for %d bases" % total)
 
-    # Fill buffer with 'N' (78) and copy reads
-    memset(buf, 78, total)
-    st = 0
-    for i in range(n_reads):
-        rbytes = read_list[i]
-        rlen = len(rbytes)
-        if rlen > read_len:
-            rlen = read_len
-        if rlen > 0:
-            src = rbytes
-            memcpy(buf + st, src, rlen)
-        st += read_len
+    memset(buf, 65, total)
 
-    # 2-bit encode: pack 4 bases per byte
-    pos = 0
+    # Stream file, extract sequence lines (every 2nd of 4)
+    line_num = 0
+    reads_copied = 0
+    st = 0
+    with open(fastq_path, 'rb') as f:
+        for line_bytes in f:
+            if line_num & 3 == 1:
+                seq = line_bytes.rstrip(b'\r\n')
+                rlen = len(seq)
+                if rlen > read_len: rlen = read_len
+                if rlen > 0 and reads_copied < n_reads:
+                    memcpy(buf + st, <unsigned char*>seq, rlen)
+                st += read_len
+                reads_copied += 1
+            line_num += 1
+
+    # 2-bit encode
     for i in range(0, total, 4):
         b0 = _ENC_C[buf[i]]
         b1 = _ENC_C[buf[i+1]] if i+1 < total else 0
@@ -87,11 +91,18 @@ cdef bytes encode_2bit_py(bytes seq):
 
 # ── CUDA Runtime API ───────────────────────────────────────────
 cdef extern from "cuda_runtime.h":
+    ctypedef int cudaError_t
     int cudaMalloc(void** devPtr, size_t size)
     int cudaFree(void* devPtr)
     int cudaMemcpy(void* dst, const void* src, size_t count, int kind)
     int cudaMemcpyHostToDevice
     int cudaMemcpyDeviceToHost
+    int cudaGetLastError()
+    int cudaSuccess
+    int cudaErrorInvalidValue
+    int cudaErrorMemoryAllocation
+    const char* cudaGetErrorString(cudaError_t error)
+    int cudaDeviceSynchronize()
 
 cdef extern from "numpy/arrayobject.h":
     void* PyArray_DATA(np.ndarray arr)
@@ -118,6 +129,11 @@ cdef extern from "kernels.h":
         int* ref_start, int* ref_end,
     )
 
+
+# ── CUDA error helper ───────────────────────────────────────────
+cdef void _check_cuda(int err, str msg) except *:
+    if err != cudaSuccess:
+        raise RuntimeError(f"CUDA error code {err}: {msg}")
 
 cdef class HybAligner2:
     """Cython+CUDA aligner with 2-bit packed DNA."""
@@ -146,18 +162,30 @@ cdef class HybAligner2:
 
     def load_reference(self, str fasta_path, int k=0, int w=0):
         """Load FASTA, 2-bit encode, upload to GPU, build hash table.
-        
+
         Args:
-            k: k-mer size (default: 10 for good specificity, min 8)
-            w: window size for minimizer (default: k//2 + 1)
+            fasta_path: Path to reference FASTA file.
+            k: k-mer size (default: 10, range 8-15).
+            w: window size for minimizer (default: k//2 + 1).
+
+        Raises:
+            FileNotFoundError: FASTA file not found.
+            ValueError: Invalid reference or parameters.
+            RuntimeError: CUDA allocation or kernel failure.
         """
         cdef bytes ref_data, ref_packed
-        cdef int rlen, tsize
+        cdef int rlen, tsize, err
         cdef int mv = self.max_vals
 
-        # Set k, w (configurable)
-        if k <= 0: k = 10  # default: better specificity than k=8
-        if w <= 0: w = max(5, k // 2 + 1)
+        # ── Input validation ──
+        if k < 0: k = 0
+        if k == 0: k = 10
+        if k < 4 or k > 31:
+            raise ValueError(f"k-mer size must be 4-31, got {k}")
+        if w < 0: w = 0
+        if w == 0: w = max(5, k // 2 + 1)
+        if w < 2:
+            raise ValueError(f"window size must be >= 2, got {w}")
         self.k = k
         self.w = w
 
@@ -167,6 +195,8 @@ cdef class HybAligner2:
         parts = [l for l in lines if not l.startswith(b'>')]
         ref_data = b''.join(parts)
         rlen = len(ref_data)
+        if rlen < self.k + self.w:
+            raise ValueError(f"Reference too short: {rlen}bp (need >= {self.k + self.w})")
 
         # 2-bit encode
         ref_packed = encode_2bit_py(ref_data)
@@ -176,12 +206,17 @@ cdef class HybAligner2:
         if self.d_ref: cudaFree(self.d_ref)
         if self.d_table_keys: cudaFree(self.d_table_keys)
         if self.d_table_vals: cudaFree(self.d_table_vals)
+        self.d_ref = NULL
+        self.d_table_keys = NULL
+        self.d_table_vals = NULL
 
-        cudaMalloc(<void**>&self.d_ref, packed_len)
-        cudaMemcpy(self.d_ref, <const unsigned char*>ref_packed, packed_len, cudaMemcpyHostToDevice)
+        err = cudaMalloc(<void**>&self.d_ref, packed_len)
+        _check_cuda(err, f"cudaMalloc ref ({packed_len} bytes)")
+        err = cudaMemcpy(self.d_ref, <const unsigned char*>ref_packed, packed_len, cudaMemcpyHostToDevice)
+        _check_cuda(err, "cudaMemcpy ref H2D")
         self.ref_len = rlen
 
-        # Size hash table
+        # Size hash table dynamically from reference length
         tsize = 1
         n_windows = max(1, rlen // self.w)
         while tsize < n_windows * 2:
@@ -189,63 +224,118 @@ cdef class HybAligner2:
         if tsize < (1 << 18): tsize = 1 << 18
         if tsize > (1 << 24): tsize = 1 << 24
 
-        # Allocate + init GPU hash table
-        cudaMalloc(<void**>&self.d_table_keys, tsize * sizeof(unsigned long long))
-        cudaMalloc(<void**>&self.d_table_vals, tsize * mv * sizeof(int))
+        # Allocate GPU hash table
+        err = cudaMalloc(<void**>&self.d_table_keys, tsize * sizeof(unsigned long long))
+        _check_cuda(err, f"cudaMalloc table_keys ({tsize * 8} bytes)")
+        err = cudaMalloc(<void**>&self.d_table_vals, tsize * mv * sizeof(int))
+        _check_cuda(err, f"cudaMalloc table_vals ({tsize * mv * 4} bytes)")
 
+        # Init table on host, upload
         cdef np.ndarray ek = np.full(tsize, 0xFFFFFFFFFFFFFFFF, dtype=np.uint64)
         cdef np.ndarray ev = np.full(tsize * mv, -1, dtype=np.int32)
-        cudaMemcpy(self.d_table_keys, PyArray_DATA(ek), tsize * 8, cudaMemcpyHostToDevice)
-        cudaMemcpy(self.d_table_vals, PyArray_DATA(ev), tsize * mv * 4, cudaMemcpyHostToDevice)
+        err = cudaMemcpy(self.d_table_keys, PyArray_DATA(ek), tsize * 8, cudaMemcpyHostToDevice)
+        _check_cuda(err, "cudaMemcpy table_keys init H2D")
+        err = cudaMemcpy(self.d_table_vals, PyArray_DATA(ev), tsize * mv * 4, cudaMemcpyHostToDevice)
+        _check_cuda(err, "cudaMemcpy table_vals init H2D")
 
-        launch_build_index(
+        err = launch_build_index(
             self.d_ref, rlen, self.k, self.w,
             self.d_table_keys, self.d_table_vals, tsize, mv,
         )
+        if err != 0:
+            raise RuntimeError(f"build_index kernel failed (error {err})")
         self.table_size = tsize
 
     def align(self, str fastq_path, int band_width=50, int gap_open=5, int gap_extend=2):
-        """Align FASTQ reads. CPU: encode+chain. GPU: seed+SW."""
+        """Align FASTQ reads. CPU: encode+chain. GPU: seed+SW.
+
+        Args:
+            fastq_path: Path to FASTQ file.
+            band_width: Band width for SW (capped at 80).
+            gap_open: Gap open penalty.
+            gap_extend: Gap extend penalty.
+
+        Returns:
+            dict with alignment results.
+
+        Raises:
+            FileNotFoundError: FASTQ file not found.
+            ValueError: Empty input or invalid parameters.
+            RuntimeError: GPU allocation or kernel failure.
+        """
         cdef bytes padded_packed
-        cdef int n_reads, read_len, i, n_seeded
+        cdef int n_reads, read_len, i, n_seeded, err
         cdef unsigned char* d_reads
-        cdef int* d_rp, *d_fp, *d_anchor_rp, *d_anchor_fp
+        cdef int* d_rp
+        cdef int* d_fp
+        cdef int* d_anchor_rp
+        cdef int* d_anchor_fp
         cdef float* d_scores
-        cdef int* d_rs, *d_re, *d_fs, *d_fe
+        cdef int* d_rs
+        cdef int* d_re
+        cdef int* d_fs
+        cdef int* d_fe
         cdef np.ndarray[np.int32_t, ndim=1] rp_arr, fp_arr
         cdef np.ndarray[np.int32_t, ndim=1] anchor_rp_arr, anchor_fp_arr
         cdef np.ndarray[np.float32_t, ndim=1] scores_arr
         cdef np.ndarray[np.int32_t, ndim=1] rs_arr, re_arr, fs_arr, fe_arr
 
-        # ── Parse FASTQ (CPU) ──────────────────────────────
-        with open(fastq_path, 'rb') as f:
-            lines = f.read().split(b'\n')
-        read_list = [lines[i] for i in range(1, len(lines), 4)]
-        n_reads = len(read_list)
-        read_len = max(len(r) for r in read_list) if read_list else 0
+        # ── Input validation ──
+        if band_width <= 0: band_width = 20
+        if gap_open < 0: gap_open = 5
+        if gap_extend < 0: gap_extend = 2
+        if self.table_size == 0:
+            raise RuntimeError("No reference loaded. Call load_reference() first.")
 
-        # C-level padding + 2-bit encode (no Python overhead in hot loop)
-        padded_packed = pad_and_encode_c(read_list, n_reads, read_len)
+        # ── Quick scan: count reads + find max read length ──
+        n_reads = 0
+        read_len = 0
+        cdef int line_idx = 0, rl
+        with open(fastq_path, 'rb') as f:
+            for line_bytes in f:
+                if line_idx & 3 == 1:  # sequence line
+                    n_reads += 1
+                    rl = len(line_bytes.rstrip(b'\r\n'))
+                    if rl > read_len: read_len = rl
+                line_idx += 1
+
+        if n_reads == 0:
+            raise ValueError(f"No reads found in {fastq_path}")
+        if read_len < self.k:
+            raise ValueError(f"Reads too short: {read_len}bp (need >= k={self.k})")
+
+        # ── Stream encode (no intermediate list) ────────────
+        padded_packed = pad_and_encode_stream(fastq_path, n_reads, read_len)
         cdef int plen = ((<Py_ssize_t>n_reads * <Py_ssize_t>read_len + 3) >> 2)
 
         # ── Upload packed reads to GPU ─────────────────────
-        cudaMalloc(<void**>&d_reads, plen)
-        cudaMemcpy(d_reads, <const unsigned char*>padded_packed, plen, cudaMemcpyHostToDevice)
+        err = cudaMalloc(<void**>&d_reads, plen)
+        _check_cuda(err, f"cudaMalloc reads ({plen} bytes)")
+        err = cudaMemcpy(d_reads, <const unsigned char*>padded_packed, plen, cudaMemcpyHostToDevice)
+        _check_cuda(err, "cudaMemcpy reads H2D")
 
         # ── Phase 1: GPU seed reads (single best anchor) ──
         rp_arr = np.full(n_reads, -1, dtype=np.int32)
         fp_arr = np.full(n_reads, -1, dtype=np.int32)
-        cudaMalloc(<void**>&d_rp, n_reads * sizeof(int))
-        cudaMalloc(<void**>&d_fp, n_reads * sizeof(int))
+        err = cudaMalloc(<void**>&d_rp, n_reads * sizeof(int))
+        _check_cuda(err, f"cudaMalloc rp ({n_reads * 4} bytes)")
+        err = cudaMalloc(<void**>&d_fp, n_reads * sizeof(int))
+        _check_cuda(err, f"cudaMalloc fp ({n_reads * 4} bytes)")
 
-        launch_seed_reads(
+        err = launch_seed_reads(
             d_reads, n_reads, read_len,
             self.d_table_keys, self.d_table_vals,
             self.table_size, self.max_vals, self.k, self.w,
             d_rp, d_fp,
         )
-        cudaMemcpy(PyArray_DATA(rp_arr), d_rp, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
-        cudaMemcpy(PyArray_DATA(fp_arr), d_fp, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
+        if err != 0:
+            cudaFree(d_reads); cudaFree(d_rp); cudaFree(d_fp)
+            raise RuntimeError(f"seed_reads kernel failed (error {err})")
+
+        err = cudaMemcpy(PyArray_DATA(rp_arr), d_rp, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
+        _check_cuda(err, "cudaMemcpy rp D2H")
+        err = cudaMemcpy(PyArray_DATA(fp_arr), d_fp, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
+        _check_cuda(err, "cudaMemcpy fp D2H")
         cudaFree(d_rp); cudaFree(d_fp)
 
         # ── Phase 2: CPU anchor chaining (numpy-vectorized) ──
@@ -254,10 +344,14 @@ cdef class HybAligner2:
         n_seeded = int((anchor_rp_arr >= 0).sum())
 
         # Upload anchors to GPU
-        cudaMalloc(<void**>&d_anchor_rp, n_reads * sizeof(int))
-        cudaMalloc(<void**>&d_anchor_fp, n_reads * sizeof(int))
-        cudaMemcpy(d_anchor_rp, PyArray_DATA(anchor_rp_arr), n_reads * sizeof(int), cudaMemcpyHostToDevice)
-        cudaMemcpy(d_anchor_fp, PyArray_DATA(anchor_fp_arr), n_reads * sizeof(int), cudaMemcpyHostToDevice)
+        err = cudaMalloc(<void**>&d_anchor_rp, n_reads * sizeof(int))
+        _check_cuda(err, "cudaMalloc anchor_rp")
+        err = cudaMalloc(<void**>&d_anchor_fp, n_reads * sizeof(int))
+        _check_cuda(err, "cudaMalloc anchor_fp")
+        err = cudaMemcpy(d_anchor_rp, PyArray_DATA(anchor_rp_arr), n_reads * sizeof(int), cudaMemcpyHostToDevice)
+        _check_cuda(err, "cudaMemcpy anchor_rp H2D")
+        err = cudaMemcpy(d_anchor_fp, PyArray_DATA(anchor_fp_arr), n_reads * sizeof(int), cudaMemcpyHostToDevice)
+        _check_cuda(err, "cudaMemcpy anchor_fp H2D")
 
         # ── Phase 3: GPU windowed SW ───────────────────────
         scores_arr = np.zeros(n_reads, dtype=np.float32)
@@ -266,25 +360,40 @@ cdef class HybAligner2:
         fs_arr = np.zeros(n_reads, dtype=np.int32)
         fe_arr = np.zeros(n_reads, dtype=np.int32)
 
-        cudaMalloc(<void**>&d_scores, n_reads * sizeof(float))
-        cudaMalloc(<void**>&d_rs, n_reads * sizeof(int))
-        cudaMalloc(<void**>&d_re, n_reads * sizeof(int))
-        cudaMalloc(<void**>&d_fs, n_reads * sizeof(int))
-        cudaMalloc(<void**>&d_fe, n_reads * sizeof(int))
+        err = cudaMalloc(<void**>&d_scores, n_reads * sizeof(float))
+        _check_cuda(err, "cudaMalloc scores")
+        err = cudaMalloc(<void**>&d_rs, n_reads * sizeof(int))
+        _check_cuda(err, "cudaMalloc rs")
+        err = cudaMalloc(<void**>&d_re, n_reads * sizeof(int))
+        _check_cuda(err, "cudaMalloc re")
+        err = cudaMalloc(<void**>&d_fs, n_reads * sizeof(int))
+        _check_cuda(err, "cudaMalloc fs")
+        err = cudaMalloc(<void**>&d_fe, n_reads * sizeof(int))
+        _check_cuda(err, "cudaMalloc fe")
 
-        launch_sw_align(
+        err = launch_sw_align(
             d_reads, self.d_ref, self.ref_len,
             d_anchor_rp, d_anchor_fp,
             n_reads, read_len,
             band_width, gap_open, gap_extend,
             d_scores, d_rs, d_re, d_fs, d_fe,
         )
+        if err != 0:
+            cudaFree(d_reads)
+            cudaFree(d_anchor_rp); cudaFree(d_anchor_fp)
+            cudaFree(d_scores); cudaFree(d_rs); cudaFree(d_re); cudaFree(d_fs); cudaFree(d_fe)
+            raise RuntimeError(f"sw_align kernel failed (error {err})")
 
-        cudaMemcpy(PyArray_DATA(scores_arr), d_scores, n_reads * sizeof(float), cudaMemcpyDeviceToHost)
-        cudaMemcpy(PyArray_DATA(rs_arr), d_rs, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
-        cudaMemcpy(PyArray_DATA(re_arr), d_re, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
-        cudaMemcpy(PyArray_DATA(fs_arr), d_fs, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
-        cudaMemcpy(PyArray_DATA(fe_arr), d_fe, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
+        err = cudaMemcpy(PyArray_DATA(scores_arr), d_scores, n_reads * sizeof(float), cudaMemcpyDeviceToHost)
+        _check_cuda(err, "cudaMemcpy scores D2H")
+        err = cudaMemcpy(PyArray_DATA(rs_arr), d_rs, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
+        _check_cuda(err, "cudaMemcpy rs D2H")
+        err = cudaMemcpy(PyArray_DATA(re_arr), d_re, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
+        _check_cuda(err, "cudaMemcpy re D2H")
+        err = cudaMemcpy(PyArray_DATA(fs_arr), d_fs, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
+        _check_cuda(err, "cudaMemcpy fs D2H")
+        err = cudaMemcpy(PyArray_DATA(fe_arr), d_fe, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
+        _check_cuda(err, "cudaMemcpy fe D2H")
 
         cudaFree(d_reads)
         cudaFree(d_anchor_rp); cudaFree(d_anchor_fp)

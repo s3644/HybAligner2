@@ -1,0 +1,21 @@
+# Build artifacts
+build/
+hyb2/*.so
+hyb2/*.o
+hyb2/*.cpp
+hyb2/__pycache__/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Temp test data
+/tmp/test_*

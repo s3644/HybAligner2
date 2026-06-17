@@ -8,6 +8,10 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+/* Max band_width supported by fixed-size local arrays (161 = 2*80+1).
+   Kernel silently caps at this to avoid stack corruption. */
+#define MAX_BAND_WIDTH 80
+
 typedef unsigned long long u64;
 
 /* ── 2-bit DNA helpers ──────────────────────────────────────── */
@@ -111,11 +115,17 @@ __global__ void sw_align_local(
     if (rid >= n_reads) return;
     int rl_bytes = (read_len + 3) >> 2;
     const uint8_t* read = reads + rid * rl_bytes;
-    int band = 2 * band_width + 1;  /* max 161 for bw<=80 */
+    /* Cap band_width to avoid overflow of fixed-size local arrays */
+    if (band_width > MAX_BAND_WIDTH) band_width = MAX_BAND_WIDTH;
+    int band = 2 * band_width + 1;  /* at most 161 */
 
     /* Fixed-size local arrays (L1-cached, no shmem limit) */
-    int prev_M[161], prev_Ix[161], prev_Iy[161];
-    int curr_M[161], curr_Ix[161], curr_Iy[161];
+    int prev_M[MAX_BAND_WIDTH * 2 + 1];
+    int prev_Ix[MAX_BAND_WIDTH * 2 + 1];
+    int prev_Iy[MAX_BAND_WIDTH * 2 + 1];
+    int curr_M[MAX_BAND_WIDTH * 2 + 1];
+    int curr_Ix[MAX_BAND_WIDTH * 2 + 1];
+    int curr_Iy[MAX_BAND_WIDTH * 2 + 1];
 
     int ar = anchor_rp[rid], af = anchor_fp[rid];
     if (ar < 0 || af < 0) {
@@ -124,9 +134,13 @@ __global__ void sw_align_local(
         ref_start[rid] = ref_len; ref_end[rid] = 0;
         return;
     }
-    int rws = af - ar - band_width;
-    if (rws < 0) rws = 0; if (rws >= ref_len) rws = ref_len - 1;
-    int rwe = rws + read_len + band;
+    /* Center the band on the anchor diagonal diag = af - ar.
+       The band covers ref positions [diag - bw, diag + bw] at each read position i,
+       so overall ref window = [diag - bw, diag + read_len - 1 + bw]. */
+    int diag = af - ar;
+    int rws = diag - band_width;
+    int rwe = diag + read_len + band_width;
+    if (rws < 0) rws = 0;
     if (rwe > ref_len) rwe = ref_len;
 
     for (int k = 0; k < band; k++) prev_M[k] = prev_Ix[k] = prev_Iy[k] = 0;
@@ -134,25 +148,26 @@ __global__ void sw_align_local(
 
     for (int i = 0; i < read_len; i++) {
         int rc = get_base(read, i);
-        int js = rws + i - band_width, je = rws + i + band_width;
-        if (js < rws) js = rws; if (je >= rwe) je = rwe - 1;
+        int js = diag + i - band_width, je = diag + i + band_width;
+        if (js < rws) js = rws;
+        if (je >= rwe) je = rwe - 1;
         for (int jj = js; jj <= je; jj++)
-            curr_M[jj-(rws+i)+band_width] = curr_Ix[jj-(rws+i)+band_width] = curr_Iy[jj-(rws+i)+band_width] = 0;
+            curr_M[jj-(diag+i)+band_width] = curr_Ix[jj-(diag+i)+band_width] = curr_Iy[jj-(diag+i)+band_width] = 0;
         for (int jj = js; jj <= je; jj++) {
-            int k = jj-(rws+i)+band_width, s = SCORE[rc][get_base(ref,jj)];
-            int diag = prev_M[k]; if (prev_Ix[k]>diag) diag=prev_Ix[k]; if (prev_Iy[k]>diag) diag=prev_Iy[k];
-            curr_M[k] = (diag+s>0)?diag+s:0;
+            int k = jj-(diag+i)+band_width, s = SCORE[rc][get_base(ref,jj)];
+            int d = prev_M[k]; if (prev_Ix[k]>d) d=prev_Ix[k]; if (prev_Iy[k]>d) d=prev_Iy[k];
+            curr_M[k] = (d+s>0)?d+s:0;
             int ix = 0;
             if (k+1<band) { int fm=prev_M[k+1]-gap_open-gap_extend, fi=prev_Ix[k+1]-gap_extend; ix=(fm>fi)?fm:fi; }
             curr_Ix[k] = (ix>0)?ix:0;
         }
         for (int jj = js; jj <= je; jj++) {
-            int k = jj-(rws+i)+band_width, iy = 0;
+            int k = jj-(diag+i)+band_width, iy = 0;
             if (k>0) { int fm=curr_M[k-1]-gap_open-gap_extend, fi=curr_Iy[k-1]-gap_extend; iy=(fm>fi)?fm:fi; }
             curr_Iy[k] = (iy>0)?iy:0;
         }
         for (int jj = js; jj <= je; jj++) {
-            int k = jj-(rws+i)+band_width;
+            int k = jj-(diag+i)+band_width;
             if (curr_M[k]>best) { best=curr_M[k]; best_i=i; best_j=jj; }
         }
         for (int k = 0; k < band; k++) {
@@ -162,10 +177,22 @@ __global__ void sw_align_local(
         }
     }
     scores[rid]=(float)best;
-    read_start[rid]=(best>0)?0:read_len; read_end[rid]=(best>0)?read_len:0;
-    ref_start[rid]=(best>0)?(best_j-best_i):ref_len;
-    ref_end[rid]=(best>0)?(best_j-best_i+read_len):0;
-    if(ref_start[rid]<0)ref_start[rid]=0; if(ref_end[rid]>ref_len)ref_end[rid]=ref_len;
+    if (best > 0) {
+        /* Traceback-free boundaries: best (i,j) is the endpoint.
+           Walk back along the best path by re-tracing along the
+           diagonal to estimate the start; for simplicity use the
+           alignment's diagonal span. */
+        int ref_diag = best_j - best_i;
+        read_start[rid] = 0;       /* full-read estimate */
+        read_end[rid] = read_len;
+        ref_start[rid] = ref_diag;
+        ref_end[rid] = ref_diag + read_len;
+    } else {
+        read_start[rid] = read_len; read_end[rid] = 0;
+        ref_start[rid] = ref_len; ref_end[rid] = 0;
+    }
+    if (ref_start[rid] < 0) ref_start[rid] = 0;
+    if (ref_end[rid] > ref_len) ref_end[rid] = ref_len;
 }
 
 /* ── C-callable launchers ───────────────────────────────────── */
