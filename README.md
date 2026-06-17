@@ -173,13 +173,14 @@ See [`GAP_ANALYSIS.md`](./GAP_ANALYSIS.md) for detailed performance analysis.
 If you use HybAligner2 in your research, please cite:
 
 ```bibtex
-@software{hybaligner2_2026,
-  author    = {s3644},
-  title     = {{HybAligner2}: {GPU}-accelerated {DNA} sequence aligner},
-  version   = {2.1.0},
-  year      = {2026},
-  month     = {6},
-  url       = {https://github.com/s3644/HybAligner2},
+@software{HybAligner2026,
+  author       = {Jitpimolmard, Jukrapoke},
+  title        = {HybAligner: {GPU}-Accelerated Sequence Aligner for {DGX} Spark},
+  year         = {2026},
+  version      = {2.1.0},
+  publisher    = {{KKU} National Phenome Institute, Khon Kaen University},
+  url          = {https://github.com/s3644/HybAligner2},
+  orcid        = {https://orcid.org/0009-0001-9170-426X},
 }
 ```
 
