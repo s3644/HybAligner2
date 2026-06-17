@@ -248,15 +248,10 @@ cdef class HybAligner2:
         cudaMemcpy(PyArray_DATA(fp_arr), d_fp, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
         cudaFree(d_rp); cudaFree(d_fp)
 
-        # ── Phase 2: CPU anchor chaining (single-anchor passthrough) ──
-        anchor_rp_arr = np.full(n_reads, -1, dtype=np.int32)
-        anchor_fp_arr = np.full(n_reads, -1, dtype=np.int32)
-        n_seeded = 0
-        for i in range(n_reads):
-            if rp_arr[i] >= 0 and fp_arr[i] >= 0:
-                anchor_rp_arr[i] = rp_arr[i]
-                anchor_fp_arr[i] = fp_arr[i]
-                n_seeded += 1
+        # ── Phase 2: CPU anchor chaining (numpy-vectorized) ──
+        anchor_rp_arr = np.where((rp_arr >= 0) & (fp_arr >= 0), rp_arr, -1).astype(np.int32)
+        anchor_fp_arr = np.where((rp_arr >= 0) & (fp_arr >= 0), fp_arr, -1).astype(np.int32)
+        n_seeded = int((anchor_rp_arr >= 0).sum())
 
         # Upload anchors to GPU
         cudaMalloc(<void**>&d_anchor_rp, n_reads * sizeof(int))
@@ -295,13 +290,18 @@ cdef class HybAligner2:
         cudaFree(d_anchor_rp); cudaFree(d_anchor_fp)
         cudaFree(d_scores); cudaFree(d_rs); cudaFree(d_re); cudaFree(d_fs); cudaFree(d_fe)
 
-        pos = scores_arr > 0
+        # Results
+        cdef float sm = 0.0
+        cdef float smax = 0.0
+        if n_reads > 0:
+            smax = float(np.max(scores_arr))
+            pos_vals = scores_arr[scores_arr > 0]
+            if len(pos_vals) > 0:
+                sm = float(np.mean(pos_vals))
         return {
-            "n_reads": n_reads,
-            "n_seeded": n_seeded,
+            "n_reads": n_reads, "n_seeded": n_seeded,
             "scores": scores_arr,
             "read_start": rs_arr, "read_end": re_arr,
             "ref_start": fs_arr, "ref_end": fe_arr,
-            "score_mean": float(np.mean(scores_arr[pos])) if pos.any() else 0.0,
-            "score_max": float(np.max(scores_arr)) if n_reads else 0.0,
+            "score_mean": sm, "score_max": smax,
         }
