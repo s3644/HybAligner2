@@ -10,20 +10,70 @@ Pipeline:
 """
 
 from libc.stdlib cimport malloc, free
-from libc.string cimport memcpy
+from libc.string cimport memcpy, memset
 cimport numpy as np
 import numpy as np
 
 np.import_array()
 
-# ── 2-bit DNA encoding (CPU, vectorized via numpy) ───────────
-# A=0, C=1, G=2, T=3, N=3  (N→T avoids false A-matches in N-blocks)
+# ── C-level padding + encode (no Python overhead) ─────────────
+
+cdef unsigned char _ENC_C[256]
+# Initialize C lookup table
+for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3),(78,3),(110,3)]:
+    _ENC_C[c] = v
+
+cdef bytes pad_and_encode_c(list read_list, int n_reads, int read_len):
+    """C-level: pre-allocate N-buffer, copy reads, 2-bit encode. No Python in hot loop."""
+    cdef Py_ssize_t total = <Py_ssize_t>n_reads * <Py_ssize_t>read_len
+    cdef Py_ssize_t packed_total = (total + 3) >> 2
+    cdef Py_ssize_t i, j, st
+    cdef int rlen, pos
+    cdef unsigned char* buf = <unsigned char*>malloc(total)
+    cdef unsigned char* packed = <unsigned char*>malloc(packed_total)
+    cdef unsigned char* src
+    cdef bytes rbytes
+    cdef unsigned char b0, b1, b2, b3
+
+    if buf == NULL or packed == NULL:
+        free(buf); free(packed)
+        raise MemoryError("malloc failed for %d bases" % total)
+
+    # Fill buffer with 'N' (78) and copy reads
+    memset(buf, 78, total)
+    st = 0
+    for i in range(n_reads):
+        rbytes = read_list[i]
+        rlen = len(rbytes)
+        if rlen > read_len:
+            rlen = read_len
+        if rlen > 0:
+            src = rbytes
+            memcpy(buf + st, src, rlen)
+        st += read_len
+
+    # 2-bit encode: pack 4 bases per byte
+    pos = 0
+    for i in range(0, total, 4):
+        b0 = _ENC_C[buf[i]]
+        b1 = _ENC_C[buf[i+1]] if i+1 < total else 0
+        b2 = _ENC_C[buf[i+2]] if i+2 < total else 0
+        b3 = _ENC_C[buf[i+3]] if i+3 < total else 0
+        packed[pos] = (b0 << 6) | (b1 << 4) | (b2 << 2) | b3
+        pos += 1
+
+    cdef bytes result = packed[:packed_total]
+    free(buf)
+    free(packed)
+    return result
+
+# Keep numpy table for reference encoding (one-time, small)
 _ENCODE = np.zeros(256, dtype=np.uint8)
 for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3),(78,3),(110,3)]:
     _ENCODE[c] = v
 
 cdef bytes encode_2bit_py(bytes seq):
-    """Pack ASCII DNA → 2-bit packed bytes (kept for small batches)."""
+    """Pack reference DNA → 2-bit (one-time, small ref)."""
     cdef int n = len(seq)
     cdef np.ndarray[np.uint8_t, ndim=1] enc = _ENCODE[bytearray(seq)]
     cdef np.ndarray[np.uint8_t, ndim=1] packed = np.zeros((n + 3) >> 2, dtype=np.uint8)
@@ -34,21 +84,6 @@ cdef bytes encode_2bit_py(bytes seq):
                        ((enc[i+2] if i+2 < n   else 0) << 2) | \
                        ((enc[i+3] if i+3 < n   else 0))
     return packed.tobytes()
-
-def _encode_all_vectorized(padded, n_reads, read_len):
-    """Vectorized 2-bit encoding: numpy ops over all reads at once."""
-    cdef Py_ssize_t total = <Py_ssize_t>n_reads * <Py_ssize_t>read_len
-    cdef int pad = (4 - (total % 4)) % 4
-    cdef np.ndarray[np.uint8_t, ndim=1] enc = _ENCODE[np.frombuffer(padded, dtype=np.uint8)]
-    if pad:
-        enc = np.pad(enc, (0, pad), constant_values=0)
-    cdef np.ndarray[np.uint8_t, ndim=2] enc_2d = enc.reshape(-1, 4)
-    cdef np.ndarray[np.uint32_t, ndim=1] p32 = np.zeros(enc_2d.shape[0], dtype=np.uint32)
-    p32 = (enc_2d[:,0].astype(np.uint32) << 6) | \
-          (enc_2d[:,1].astype(np.uint32) << 4) | \
-          (enc_2d[:,2].astype(np.uint32) << 2) | \
-           enc_2d[:,3].astype(np.uint32)
-    return p32.astype(np.uint8).tobytes()
 
 # ── CUDA Runtime API ───────────────────────────────────────────
 cdef extern from "cuda_runtime.h":
@@ -189,10 +224,9 @@ cdef class HybAligner2:
         n_reads = len(read_list)
         read_len = max(len(r) for r in read_list) if read_list else 0
 
-        # Vectorized 2-bit encode: pad all reads, encode in one numpy pass
-        cdef bytes padded = b''.join(r.ljust(read_len, b'N')[:read_len] for r in read_list)
-        padded_packed = _encode_all_vectorized(padded, n_reads, read_len)
-        cdef int plen = ((<Py_ssize_t>n_reads * <Py_ssize_t>read_len + 3) >> 2)  # packed bytes total
+        # C-level padding + 2-bit encode (no Python overhead in hot loop)
+        padded_packed = pad_and_encode_c(read_list, n_reads, read_len)
+        cdef int plen = ((<Py_ssize_t>n_reads * <Py_ssize_t>read_len + 3) >> 2)
 
         # ── Upload packed reads to GPU ─────────────────────
         cudaMalloc(<void**>&d_reads, plen)
