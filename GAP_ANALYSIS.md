@@ -13,11 +13,18 @@
 | GAP 1 (build) | ✅ **Resolved** | Created `kernels.h`, switched `cdef extern from` to `.h`, fixed numpy void* casts |
 | GAP 2 (anchoring) | ✅ **Resolved** | `sw_align_local` windows around anchor diagonal; also fixed **band centering** (anchor was at k=2bw, now centered at k=bw) |
 | GAP 3 (shmem overflow) | ✅ **Resolved** | Switched from `extern __shared__` to **per-thread local arrays** — no shmem limits, L1-cached |
+| GAP 4 (chaining) | ✅ **Resolved** | Added `seed_reads_multi` + `chain_anchors` GPU kernels with 1D DP over diagonals (minimap2-style) |
+| GAP 5 (two-stage seed) | ✅ **Resolved** | Multi-seed extraction with up to 32 anchors per read for chaining |
+| GAP 6 (table size) | ✅ **Resolved** | Dynamic table sizing: `tsize = next_power_of_2(ref_len / w * 2)` clamped to [2^18, 2^24] |
+| GAP 7 (streams) | ✅ **Resolved** | Dual CUDA streams (`stream0`, `stream1`) with async kernel launchers |
 | GAP 8 (SW score bugs) | ✅ **Resolved** | Unused `up`/`left` variables removed in kernel rewrite |
+| GAP 9 (I/O threads) | ⏳ **Pending** | `run.py` accepts `-t/--threads` but not implemented |
 | GAP 10 (error handling) | ✅ **Resolved** | `_check_cuda` wrapper on all CUDA calls; kernel return codes checked; input validation (k,w,ref_len,read_len) |
 | GAP 11 (N-padding) | ✅ **Resolved** | Padding changed from `N` (→3=T/G) to `A` (→0=neutral) — eliminates spurious minimizers |
 | GAP 12 (fixed bounds) | ✅ **Resolved** | `ref_start`/`ref_end` derived from best (i,j); added guard against overflow |
-| GAP 1–3 blocker | 🟢 **Build now clean** | Zero compiler warnings, module imports OK, synthetic test passes |
+| GAP 13 (2-bit encoding) | ✅ **Resolved** | Pre-existing: all kernels use 2-bit packed DNA |
+| GAP 14 (batch-by-window) | ⏳ **Pending** | Future optimization: group reads by ref window for coalesced access |
+| GAP 1–7 blocker | 🟢 **All critical gaps resolved** | Build clean, multi-seed chaining, async streams, dynamic sizing |
 
 ---
 
