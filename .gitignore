@@ -1,21 +1,52 @@
+```
+# Compiled Python files
+*.pyc
+__pycache__/
+
 # Build artifacts
 build/
-hyb2/*.so
-hyb2/*.o
-hyb2/*.cpp
-hyb2/__pycache__/
+dist/
+*.so
+*.dylib
+*.dll
 
-# Python cache
-__pycache__/
-*.py[cod]
-*.pyo
+# CUDA compilation artifacts
+*.cu.o
+*.ptx
 
-# IDE
+# Cython artifacts
+*.c
+*.html
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE files
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# macOS
+# Logs
+*.log
+
+# Coverage reports
+.coverage
+coverage/
+htmlcov/
+
+# Environment files
+.env
+.env.local
+*.env.*
+
+# OS files
 .DS_Store
+Thumbs.db
 
-# Temp test data
-/tmp/test_*
+# Testing
+.pytest_cache/
+.mypy_cache/
+```

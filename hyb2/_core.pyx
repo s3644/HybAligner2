@@ -92,6 +92,7 @@ cdef bytes encode_2bit_py(bytes seq):
 # ── CUDA Runtime API ───────────────────────────────────────────
 cdef extern from "cuda_runtime.h":
     ctypedef int cudaError_t
+    ctypedef void* cudaStream_t
     int cudaMalloc(void** devPtr, size_t size)
     int cudaFree(void* devPtr)
     int cudaMemcpy(void* dst, const void* src, size_t count, int kind)
@@ -103,6 +104,9 @@ cdef extern from "cuda_runtime.h":
     int cudaErrorMemoryAllocation
     const char* cudaGetErrorString(cudaError_t error)
     int cudaDeviceSynchronize()
+    int cudaStreamCreate(cudaStream_t* pStream)
+    int cudaStreamDestroy(cudaStream_t stream)
+    int cudaStreamSynchronize(cudaStream_t stream)
 
 cdef extern from "numpy/arrayobject.h":
     void* PyArray_DATA(np.ndarray arr)
@@ -114,11 +118,16 @@ cdef extern from "kernels.h":
         unsigned long long* table_keys, int* table_vals,
         int table_size, int max_vals_per_key,
     )
-    int launch_seed_reads(
+    int launch_seed_reads_multi(
         const unsigned char* reads, int n_reads, int read_len,
         const unsigned long long* table_keys, const int* table_vals,
         int table_size, int max_vals_per_key, int k, int w,
-        int* out_rp, int* out_fp,
+        int* out_rp, int* out_fp, int* out_counts,
+    )
+    int launch_chain_anchors(
+        const int* rp, const int* fp, const int* counts, int n_reads,
+        int max_gap, int penalty,
+        int* best_rp, int* best_fp,
     )
     int launch_sw_align(
         const unsigned char* reads, const unsigned char* ref, int ref_len,
@@ -128,6 +137,26 @@ cdef extern from "kernels.h":
         float* scores, int* read_start, int* read_end,
         int* ref_start, int* ref_end,
     )
+    int launch_seed_reads_multi_async(
+        const unsigned char* reads, int n_reads, int read_len,
+        const unsigned long long* table_keys, const int* table_vals,
+        int table_size, int max_vals_per_key, int k, int w,
+        int* out_rp, int* out_fp, int* out_counts, void* stream,
+    )
+    int launch_chain_anchors_async(
+        const int* rp, const int* fp, const int* counts, int n_reads,
+        int max_gap, int penalty,
+        int* best_rp, int* best_fp, void* stream,
+    )
+    int launch_sw_align_async(
+        const unsigned char* reads, const unsigned char* ref, int ref_len,
+        const int* anchor_rp, const int* anchor_fp,
+        int n_reads, int read_len,
+        int band_width, int gap_open, int gap_extend,
+        float* scores, int* read_start, int* read_end,
+        int* ref_start, int* ref_end,
+        void* stream,
+    )
 
 
 # ── CUDA error helper ───────────────────────────────────────────
@@ -136,7 +165,7 @@ cdef void _check_cuda(int err, str msg) except *:
         raise RuntimeError(f"CUDA error code {err}: {msg}")
 
 cdef class HybAligner2:
-    """Cython+CUDA aligner with 2-bit packed DNA."""
+    """Cython+CUDA aligner with 2-bit packed DNA with CUDA streams for async operation."""
 
     cdef:
         unsigned char* d_ref
@@ -145,6 +174,9 @@ cdef class HybAligner2:
         int* d_table_vals
         int table_size
         int k, w, max_vals
+        void* stream0
+        void* stream1
+        bint use_streams
 
     def __cinit__(self):
         self.d_ref = NULL
@@ -154,19 +186,25 @@ cdef class HybAligner2:
         self.w = 5
         self.max_vals = 8
         self.table_size = 0
+        self.stream0 = NULL
+        self.stream1 = NULL
+        self.use_streams = False
 
     def __dealloc__(self):
         if self.d_ref:          cudaFree(self.d_ref)
         if self.d_table_keys:   cudaFree(self.d_table_keys)
         if self.d_table_vals:   cudaFree(self.d_table_vals)
+        if self.stream0:        cudaStreamDestroy(<cudaStream_t>self.stream0)
+        if self.stream1:        cudaStreamDestroy(<cudaStream_t>self.stream1)
 
-    def load_reference(self, str fasta_path, int k=0, int w=0):
+    def load_reference(self, str fasta_path, int k=0, int w=0, bint use_streams=True):
         """Load FASTA, 2-bit encode, upload to GPU, build hash table.
 
         Args:
             fasta_path: Path to reference FASTA file.
             k: k-mer size (default: 10, range 8-15).
             w: window size for minimizer (default: k//2 + 1).
+            use_streams: Enable CUDA streams for async operation (default: True).
 
         Raises:
             FileNotFoundError: FASTA file not found.
@@ -188,6 +226,7 @@ cdef class HybAligner2:
             raise ValueError(f"window size must be >= 2, got {w}")
         self.k = k
         self.w = w
+        self.use_streams = use_streams
 
         # Read FASTA
         with open(fasta_path, 'rb') as f:
@@ -201,6 +240,13 @@ cdef class HybAligner2:
         # 2-bit encode
         ref_packed = encode_2bit_py(ref_data)
         cdef int packed_len = len(ref_packed)
+
+        # Create CUDA streams for async operation
+        if self.use_streams:
+            err = cudaStreamCreate(<cudaStream_t*>&self.stream0)
+            _check_cuda(err, "cudaStreamCreate stream0")
+            err = cudaStreamCreate(<cudaStream_t*>&self.stream1)
+            _check_cuda(err, "cudaStreamCreate stream1")
 
         # Upload packed reference to GPU
         if self.d_ref: cudaFree(self.d_ref)
@@ -314,46 +360,117 @@ cdef class HybAligner2:
         err = cudaMemcpy(d_reads, <const unsigned char*>padded_packed, plen, cudaMemcpyHostToDevice)
         _check_cuda(err, "cudaMemcpy reads H2D")
 
-        # ── Phase 1: GPU seed reads (single best anchor) ──
-        rp_arr = np.full(n_reads, -1, dtype=np.int32)
-        fp_arr = np.full(n_reads, -1, dtype=np.int32)
-        err = cudaMalloc(<void**>&d_rp, n_reads * sizeof(int))
-        _check_cuda(err, f"cudaMalloc rp ({n_reads * 4} bytes)")
-        err = cudaMalloc(<void**>&d_fp, n_reads * sizeof(int))
-        _check_cuda(err, f"cudaMalloc fp ({n_reads * 4} bytes)")
+        # ── Phase 1: GPU multi-seed extraction (up to MAX_ANCHORS per read) ──
+        cdef int MAX_ANCHORS = 32
+        cdef np.ndarray[np.int32_t, ndim=2] rp_multi_arr = np.zeros((n_reads, MAX_ANCHORS), dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=2] fp_multi_arr = np.zeros((n_reads, MAX_ANCHORS), dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1] counts_arr = np.zeros(n_reads, dtype=np.int32)
+        
+        err = cudaMalloc(<void**>&d_rp, n_reads * MAX_ANCHORS * sizeof(int))
+        _check_cuda(err, f"cudaMalloc rp_multi ({n_reads * MAX_ANCHORS * 4} bytes)")
+        err = cudaMalloc(<void**>&d_fp, n_reads * MAX_ANCHORS * sizeof(int))
+        _check_cuda(err, f"cudaMalloc fp_multi ({n_reads * MAX_ANCHORS * 4} bytes)")
+        cdef int* d_counts
+        err = cudaMalloc(<void**>&d_counts, n_reads * sizeof(int))
+        _check_cuda(err, f"cudaMalloc counts ({n_reads * 4} bytes)")
 
-        err = launch_seed_reads(
-            d_reads, n_reads, read_len,
-            self.d_table_keys, self.d_table_vals,
-            self.table_size, self.max_vals, self.k, self.w,
-            d_rp, d_fp,
-        )
-        if err != 0:
-            cudaFree(d_reads); cudaFree(d_rp); cudaFree(d_fp)
-            raise RuntimeError(f"seed_reads kernel failed (error {err})")
+        if self.use_streams and self.stream0 != NULL:
+            # Use async kernel launch on stream0
+            err = launch_seed_reads_multi_async(
+                d_reads, n_reads, read_len,
+                self.d_table_keys, self.d_table_vals,
+                self.table_size, self.max_vals, self.k, self.w,
+                d_rp, d_fp, d_counts, self.stream0,
+            )
+            if err != 0:
+                cudaFree(d_reads); cudaFree(d_rp); cudaFree(d_fp); cudaFree(d_counts)
+                raise RuntimeError(f"seed_reads_multi_async kernel failed (error {err})")
+            # Synchronize stream before copying results
+            err = cudaStreamSynchronize(<cudaStream_t>self.stream0)
+            _check_cuda(err, "cudaStreamSynchronize stream0")
+        else:
+            err = launch_seed_reads_multi(
+                d_reads, n_reads, read_len,
+                self.d_table_keys, self.d_table_vals,
+                self.table_size, self.max_vals, self.k, self.w,
+                d_rp, d_fp, d_counts,
+            )
+            if err != 0:
+                cudaFree(d_reads); cudaFree(d_rp); cudaFree(d_fp); cudaFree(d_counts)
+                raise RuntimeError(f"seed_reads_multi kernel failed (error {err})")
 
-        err = cudaMemcpy(PyArray_DATA(rp_arr), d_rp, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
-        _check_cuda(err, "cudaMemcpy rp D2H")
-        err = cudaMemcpy(PyArray_DATA(fp_arr), d_fp, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
-        _check_cuda(err, "cudaMemcpy fp D2H")
-        cudaFree(d_rp); cudaFree(d_fp)
+        err = cudaMemcpy(PyArray_DATA(rp_multi_arr), d_rp, n_reads * MAX_ANCHORS * sizeof(int), cudaMemcpyDeviceToHost)
+        _check_cuda(err, "cudaMemcpy rp_multi D2H")
+        err = cudaMemcpy(PyArray_DATA(fp_multi_arr), d_fp, n_reads * MAX_ANCHORS * sizeof(int), cudaMemcpyDeviceToHost)
+        _check_cuda(err, "cudaMemcpy fp_multi D2H")
+        err = cudaMemcpy(PyArray_DATA(counts_arr), d_counts, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
+        _check_cuda(err, "cudaMemcpy counts D2H")
+        cudaFree(d_rp); cudaFree(d_fp); cudaFree(d_counts)
 
-        # ── Phase 2: CPU anchor chaining (numpy-vectorized) ──
-        anchor_rp_arr = np.where((rp_arr >= 0) & (fp_arr >= 0), rp_arr, -1).astype(np.int32)
-        anchor_fp_arr = np.where((rp_arr >= 0) & (fp_arr >= 0), fp_arr, -1).astype(np.int32)
-        n_seeded = int((anchor_rp_arr >= 0).sum())
-
-        # Upload anchors to GPU
+        # ── Phase 2: GPU anchor chaining (1D DP over diagonals) ──
+        cdef np.ndarray[np.int32_t, ndim=1] anchor_rp_arr = np.zeros(n_reads, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1] anchor_fp_arr = np.zeros(n_reads, dtype=np.int32)
+        
+        cdef int* d_anchor_rp
+        cdef int* d_anchor_fp
         err = cudaMalloc(<void**>&d_anchor_rp, n_reads * sizeof(int))
         _check_cuda(err, "cudaMalloc anchor_rp")
         err = cudaMalloc(<void**>&d_anchor_fp, n_reads * sizeof(int))
         _check_cuda(err, "cudaMalloc anchor_fp")
+        
+        # Upload multi-anchors for chaining
+        err = cudaMemcpy(d_rp, PyArray_DATA(rp_multi_arr), n_reads * MAX_ANCHORS * sizeof(int), cudaMemcpyHostToDevice)
+        _check_cuda(err, "cudaMemcpy rp_multi H2D")
+        err = cudaMemcpy(d_fp, PyArray_DATA(fp_multi_arr), n_reads * MAX_ANCHORS * sizeof(int), cudaMemcpyHostToDevice)
+        _check_cuda(err, "cudaMemcpy fp_multi H2D")
+        err = cudaMemcpy(d_counts, PyArray_DATA(counts_arr), n_reads * sizeof(int), cudaMemcpyHostToDevice)
+        _check_cuda(err, "cudaMemcpy counts H2D")
+        
+        # Run chaining kernel
+        if self.use_streams and self.stream0 != NULL:
+            err = launch_chain_anchors_async(
+                d_rp, d_fp, d_counts, n_reads,
+                max_gap=50, penalty=1,
+                d_anchor_rp, d_anchor_fp, self.stream0,
+            )
+            if err != 0:
+                cudaFree(d_reads); cudaFree(d_rp); cudaFree(d_fp); cudaFree(d_counts)
+                cudaFree(d_anchor_rp); cudaFree(d_anchor_fp)
+                raise RuntimeError(f"chain_anchors_async kernel failed (error {err})")
+            err = cudaStreamSynchronize(<cudaStream_t>self.stream0)
+            _check_cuda(err, "cudaStreamSynchronize stream0 after chain")
+        else:
+            err = launch_chain_anchors(
+                d_rp, d_fp, d_counts, n_reads,
+                max_gap=50, penalty=1,
+                d_anchor_rp, d_anchor_fp,
+            )
+            if err != 0:
+                cudaFree(d_reads); cudaFree(d_rp); cudaFree(d_fp); cudaFree(d_counts)
+                cudaFree(d_anchor_rp); cudaFree(d_anchor_fp)
+                raise RuntimeError(f"chain_anchors kernel failed (error {err})")
+        
+        # Download chained anchors
+        err = cudaMemcpy(PyArray_DATA(anchor_rp_arr), d_anchor_rp, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
+        _check_cuda(err, "cudaMemcpy anchor_rp D2H")
+        err = cudaMemcpy(PyArray_DATA(anchor_fp_arr), d_anchor_fp, n_reads * sizeof(int), cudaMemcpyDeviceToHost)
+        _check_cuda(err, "cudaMemcpy anchor_fp D2H")
+        cudaFree(d_rp); cudaFree(d_fp); cudaFree(d_counts)
+        cudaFree(d_anchor_rp); cudaFree(d_anchor_fp)
+        
+        n_seeded = int((anchor_rp_arr >= 0).sum())
+
+        # Re-upload chained anchors to GPU for SW alignment
+        err = cudaMalloc(<void**>&d_anchor_rp, n_reads * sizeof(int))
+        _check_cuda(err, "cudaMalloc anchor_rp for SW")
+        err = cudaMalloc(<void**>&d_anchor_fp, n_reads * sizeof(int))
+        _check_cuda(err, "cudaMalloc anchor_fp for SW")
         err = cudaMemcpy(d_anchor_rp, PyArray_DATA(anchor_rp_arr), n_reads * sizeof(int), cudaMemcpyHostToDevice)
         _check_cuda(err, "cudaMemcpy anchor_rp H2D")
         err = cudaMemcpy(d_anchor_fp, PyArray_DATA(anchor_fp_arr), n_reads * sizeof(int), cudaMemcpyHostToDevice)
         _check_cuda(err, "cudaMemcpy anchor_fp H2D")
 
-        # ── Phase 3: GPU windowed SW ───────────────────────
+        # ── Phase 3: GPU windowed SW with optional streams ──
         scores_arr = np.zeros(n_reads, dtype=np.float32)
         rs_arr = np.zeros(n_reads, dtype=np.int32)
         re_arr = np.zeros(n_reads, dtype=np.int32)
@@ -371,18 +488,37 @@ cdef class HybAligner2:
         err = cudaMalloc(<void**>&d_fe, n_reads * sizeof(int))
         _check_cuda(err, "cudaMalloc fe")
 
-        err = launch_sw_align(
-            d_reads, self.d_ref, self.ref_len,
-            d_anchor_rp, d_anchor_fp,
-            n_reads, read_len,
-            band_width, gap_open, gap_extend,
-            d_scores, d_rs, d_re, d_fs, d_fe,
-        )
-        if err != 0:
-            cudaFree(d_reads)
-            cudaFree(d_anchor_rp); cudaFree(d_anchor_fp)
-            cudaFree(d_scores); cudaFree(d_rs); cudaFree(d_re); cudaFree(d_fs); cudaFree(d_fe)
-            raise RuntimeError(f"sw_align kernel failed (error {err})")
+        if self.use_streams and self.stream1 != NULL:
+            # Use async kernel launch on stream1
+            err = launch_sw_align_async(
+                d_reads, self.d_ref, self.ref_len,
+                d_anchor_rp, d_anchor_fp,
+                n_reads, read_len,
+                band_width, gap_open, gap_extend,
+                d_scores, d_rs, d_re, d_fs, d_fe,
+                self.stream1,
+            )
+            if err != 0:
+                cudaFree(d_reads)
+                cudaFree(d_anchor_rp); cudaFree(d_anchor_fp)
+                cudaFree(d_scores); cudaFree(d_rs); cudaFree(d_re); cudaFree(d_fs); cudaFree(d_fe)
+                raise RuntimeError(f"sw_align_async kernel failed (error {err})")
+            # Synchronize stream before copying results
+            err = cudaStreamSynchronize(<cudaStream_t>self.stream1)
+            _check_cuda(err, "cudaStreamSynchronize stream1")
+        else:
+            err = launch_sw_align(
+                d_reads, self.d_ref, self.ref_len,
+                d_anchor_rp, d_anchor_fp,
+                n_reads, read_len,
+                band_width, gap_open, gap_extend,
+                d_scores, d_rs, d_re, d_fs, d_fe,
+            )
+            if err != 0:
+                cudaFree(d_reads)
+                cudaFree(d_anchor_rp); cudaFree(d_anchor_fp)
+                cudaFree(d_scores); cudaFree(d_rs); cudaFree(d_re); cudaFree(d_fs); cudaFree(d_fe)
+                raise RuntimeError(f"sw_align kernel failed (error {err})")
 
         err = cudaMemcpy(PyArray_DATA(scores_arr), d_scores, n_reads * sizeof(float), cudaMemcpyDeviceToHost)
         _check_cuda(err, "cudaMemcpy scores D2H")

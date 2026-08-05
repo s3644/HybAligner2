@@ -72,33 +72,116 @@ __global__ void build_index(
     }
 }
 
-/* ── Kernel 2: Seed reads (2-bit packed, single best anchor) ── */
-__global__ void seed_reads(
+/* ── Kernel 2: Multi-seed extraction for chaining ── */
+/* Extracts up to MAX_ANCHORS anchors per read for downstream chaining */
+#define MAX_ANCHORS 32
+
+__global__ void seed_reads_multi(
     const uint8_t* reads, int nr, int rl,
     const u64* tk, const int* tv, int ts, int mv,
     int k, int w,
-    int* orp, int* ofp)
+    int* out_rp, int* out_fp, int* out_counts)
 {
     int rid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (rid >= nr) { orp[rid] = -1; ofp[rid] = -1; return; }
+    if (rid >= nr) { out_counts[rid] = 0; return; }
     const uint8_t* s = reads + rid * ((rl + 3) >> 2);
     int nw = rl - k - w + 2;
-    orp[rid] = -1; ofp[rid] = -1;
-    if (nw <= 0) return;
-    for (int win = 0; win < nw; win += w) {
+    int count = 0;
+    if (nw <= 0) { out_counts[rid] = 0; return; }
+    
+    /* Collect all anchors (not just first) */
+    for (int win = 0; win < nw && count < MAX_ANCHORS; win += w) {
         u64 mh = ~0ULL; int mp = -1;
         for (int o = 0; o < w && win + o + k <= rl; o++) {
             u64 h = kmer_hash_2bit(s, win + o, k);
             if (h < mh) { mh = h; mp = win + o; }
         }
         if (mp < 0) continue;
-        for (int a = 0; a < 32; a++) {
+        
+        /* Hash table lookup */
+        for (int a = 0; a < 32 && count < MAX_ANCHORS; a++) {
             u64 p = (a == 0) ? mh : rehash(mh, a);
             unsigned s2 = p % ts;
-            if (tk[s2] == mh) { orp[rid] = mp; ofp[rid] = tv[s2 * mv]; return; }
+            if (tk[s2] == mh) { 
+                out_rp[rid * MAX_ANCHORS + count] = mp;
+                out_fp[rid * MAX_ANCHORS + count] = tv[s2 * mv];
+                count++;
+                break;
+            }
             if (tk[s2] == 0xFFFFFFFFFFFFFFFFULL) break;
         }
     }
+    out_counts[rid] = count;
+}
+
+/* ── Kernel 3: Anchor chaining with 1D DP over diagonals ── */
+/* Implements minimap2-style chaining: maximize score with colinear anchors */
+__global__ void chain_anchors(
+    const int* rp, const int* fp, const int* counts, int n_reads,
+    int max_gap, int penalty,
+    int* best_rp, int* best_fp)
+{
+    int rid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (rid >= n_reads) { best_rp[rid] = -1; best_fp[rid] = -1; return; }
+    
+    int n = counts[rid];
+    if (n == 0) { best_rp[rid] = -1; best_fp[rid] = -1; return; }
+    if (n == 1) {
+        best_rp[rid] = rp[rid * MAX_ANCHORS];
+        best_fp[rid] = fp[rid * MAX_ANCHORS];
+        return;
+    }
+    
+    /* DP arrays in registers (small n <= MAX_ANCHORS) */
+    int dp[MAX_ANCHORS];
+    int prev[MAX_ANCHORS];
+    for (int i = 0; i < n; i++) {
+        dp[i] = 1;  /* Each anchor has base score 1 */
+        prev[i] = -1;
+    }
+    
+    /* O(n^2) DP: find best chain ending at each anchor */
+    for (int i = 1; i < n; i++) {
+        int ri = rp[rid * MAX_ANCHORS + i];
+        int fi = fp[rid * MAX_ANCHORS + i];
+        int diag_i = fi - ri;
+        
+        for (int j = 0; j < i; j++) {
+            int rj = rp[rid * MAX_ANCHORS + j];
+            int fj = fp[rid * MAX_ANCHORS + j];
+            int diag_j = fj - rj;
+            
+            /* Check colinearity: same diagonal and proper order */
+            int gap_r = ri - rj;
+            int gap_f = fi - fj;
+            int gap_diff = abs(gap_r - gap_f);
+            
+            if (gap_r > 0 && gap_f > 0 && gap_diff <= max_gap) {
+                /* Same diagonal, forward direction */
+                int score = dp[j] + 1;
+                /* Penalize diagonal shift */
+                if (diag_i != diag_j) score -= penalty;
+                
+                if (score > dp[i]) {
+                    dp[i] = score;
+                    prev[i] = j;
+                }
+            }
+        }
+    }
+    
+    /* Find best ending anchor */
+    int best_idx = 0, best_score = dp[0];
+    for (int i = 1; i < n; i++) {
+        if (dp[i] > best_score) {
+            best_score = dp[i];
+            best_idx = i;
+        }
+    }
+    
+    /* Return the last anchor in the best chain */
+    best_rp[rid] = rp[rid * MAX_ANCHORS + best_idx];
+    best_fp[rid] = fp[rid * MAX_ANCHORS + best_idx];
 }
 
 __global__ void sw_align_local(
@@ -195,7 +278,7 @@ __global__ void sw_align_local(
     if (ref_end[rid] > ref_len) ref_end[rid] = ref_len;
 }
 
-/* ── C-callable launchers ───────────────────────────────────── */
+/* ── C-callable launchers with optional streams ─────────────── */
 extern "C" {
 
 int launch_build_index(
@@ -210,14 +293,26 @@ int launch_build_index(
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
-int launch_seed_reads(
+int launch_seed_reads_multi(
     const uint8_t* reads, int nr, int rl,
     const u64* tk, const int* tv, int ts, int mv,
-    int k, int w, int* orp, int* ofp)
+    int k, int w, int* out_rp, int* out_fp, int* out_counts)
 {
     int blocks = (nr + 255) / 256;
     if (blocks <= 0) return -1;
-    seed_reads<<<blocks, 256>>>(reads, nr, rl, tk, tv, ts, mv, k, w, orp, ofp);
+    seed_reads_multi<<<blocks, 256>>>(reads, nr, rl, tk, tv, ts, mv, k, w, out_rp, out_fp, out_counts);
+    cudaDeviceSynchronize();
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+int launch_chain_anchors(
+    const int* rp, const int* fp, const int* counts, int n_reads,
+    int max_gap, int penalty,
+    int* best_rp, int* best_fp)
+{
+    int threads = 256;
+    int blocks = (n_reads + threads - 1) / threads;
+    chain_anchors<<<blocks, threads>>>(rp, fp, counts, n_reads, max_gap, penalty, best_rp, best_fp);
     cudaDeviceSynchronize();
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
@@ -236,6 +331,48 @@ int launch_sw_align(
         n_reads, read_len, band_width, gap_open, gap_extend,
         scores, rs, re, fs, fe);
     cudaDeviceSynchronize();
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+/* Stream-aware launchers for async operation */
+int launch_seed_reads_multi_async(
+    const uint8_t* reads, int nr, int rl,
+    const u64* tk, const int* tv, int ts, int mv,
+    int k, int w, int* out_rp, int* out_fp, int* out_counts, void* stream)
+{
+    int blocks = (nr + 255) / 256;
+    if (blocks <= 0) return -1;
+    seed_reads_multi<<<blocks, 256, 0, (cudaStream_t)stream>>>(
+        reads, nr, rl, tk, tv, ts, mv, k, w, out_rp, out_fp, out_counts);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+int launch_chain_anchors_async(
+    const int* rp, const int* fp, const int* counts, int n_reads,
+    int max_gap, int penalty,
+    int* best_rp, int* best_fp, void* stream)
+{
+    int threads = 256;
+    int blocks = (n_reads + threads - 1) / threads;
+    chain_anchors<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+        rp, fp, counts, n_reads, max_gap, penalty, best_rp, best_fp);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+int launch_sw_align_async(
+    const uint8_t* reads, const uint8_t* ref, int ref_len,
+    const int* anchor_rp, const int* anchor_fp,
+    int n_reads, int read_len,
+    int band_width, int gap_open, int gap_extend,
+    float* scores, int* rs, int* re, int* fs, int* fe,
+    void* stream)
+{
+    int threads = 256;
+    int blocks = (n_reads + threads - 1) / threads;
+    sw_align_local<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+        reads, ref, ref_len, anchor_rp, anchor_fp,
+        n_reads, read_len, band_width, gap_open, gap_extend,
+        scores, rs, re, fs, fe);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
