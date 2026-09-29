@@ -80,7 +80,7 @@ __global__ void seed_reads(
     int* orp, int* ofp)
 {
     int rid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (rid >= nr) { orp[rid] = -1; ofp[rid] = -1; return; }
+    if (rid >= nr) return;  /* padding threads: out-of-bounds, must not write */
     const uint8_t* s = reads + rid * ((rl + 3) >> 2);
     int nw = rl - k - w + 2;
     orp[rid] = -1; ofp[rid] = -1;
@@ -112,20 +112,32 @@ __global__ void sw_align_local(
     int* __restrict__ ref_start, int* __restrict__ ref_end)
 {
     int rid = blockIdx.x * blockDim.x + threadIdx.x;
+    /* Cap band_width to avoid overflow of the shared-memory allocation
+       (must match the clamp the launcher used to size shmem). */
+    if (band_width > MAX_BAND_WIDTH) band_width = MAX_BAND_WIDTH;
+    int band = 2 * band_width + 1;  /* at most 161 */
+    int T = blockDim.x;
+
+    /* Per-thread scratch lives in real on-chip shared memory instead of
+       fixed-size local arrays (which nvcc cannot keep in registers when
+       indexed by a runtime variable — they silently spill to slow
+       local/global memory). Layout is [plane][k][thread] so that all
+       threads in a warp touch consecutive addresses for a given k
+       (coalesced, bank-conflict-free), since every thread in the block
+       iterates the same k range in lockstep. */
+    extern __shared__ int smem[];
+    int* prev_M  = smem + 0 * band * T;
+    int* prev_Ix = smem + 1 * band * T;
+    int* prev_Iy = smem + 2 * band * T;
+    int* curr_M  = smem + 3 * band * T;
+    int* curr_Ix = smem + 4 * band * T;
+    int* curr_Iy = smem + 5 * band * T;
+    int tid = threadIdx.x;
+#define AT(arr, k) arr[(k) * T + tid]
+
     if (rid >= n_reads) return;
     int rl_bytes = (read_len + 3) >> 2;
     const uint8_t* read = reads + rid * rl_bytes;
-    /* Cap band_width to avoid overflow of fixed-size local arrays */
-    if (band_width > MAX_BAND_WIDTH) band_width = MAX_BAND_WIDTH;
-    int band = 2 * band_width + 1;  /* at most 161 */
-
-    /* Fixed-size local arrays (L1-cached, no shmem limit) */
-    int prev_M[MAX_BAND_WIDTH * 2 + 1];
-    int prev_Ix[MAX_BAND_WIDTH * 2 + 1];
-    int prev_Iy[MAX_BAND_WIDTH * 2 + 1];
-    int curr_M[MAX_BAND_WIDTH * 2 + 1];
-    int curr_Ix[MAX_BAND_WIDTH * 2 + 1];
-    int curr_Iy[MAX_BAND_WIDTH * 2 + 1];
 
     int ar = anchor_rp[rid], af = anchor_fp[rid];
     if (ar < 0 || af < 0) {
@@ -143,7 +155,7 @@ __global__ void sw_align_local(
     if (rws < 0) rws = 0;
     if (rwe > ref_len) rwe = ref_len;
 
-    for (int k = 0; k < band; k++) prev_M[k] = prev_Ix[k] = prev_Iy[k] = 0;
+    for (int k = 0; k < band; k++) AT(prev_M,k) = AT(prev_Ix,k) = AT(prev_Iy,k) = 0;
     int best = 0, best_i = 0, best_j = 0;
 
     for (int i = 0; i < read_len; i++) {
@@ -151,29 +163,31 @@ __global__ void sw_align_local(
         int js = diag + i - band_width, je = diag + i + band_width;
         if (js < rws) js = rws;
         if (je >= rwe) je = rwe - 1;
-        for (int jj = js; jj <= je; jj++)
-            curr_M[jj-(diag+i)+band_width] = curr_Ix[jj-(diag+i)+band_width] = curr_Iy[jj-(diag+i)+band_width] = 0;
+        for (int jj = js; jj <= je; jj++) {
+            int k = jj-(diag+i)+band_width;
+            AT(curr_M,k) = AT(curr_Ix,k) = AT(curr_Iy,k) = 0;
+        }
         for (int jj = js; jj <= je; jj++) {
             int k = jj-(diag+i)+band_width, s = SCORE[rc][get_base(ref,jj)];
-            int d = prev_M[k]; if (prev_Ix[k]>d) d=prev_Ix[k]; if (prev_Iy[k]>d) d=prev_Iy[k];
-            curr_M[k] = (d+s>0)?d+s:0;
+            int d = AT(prev_M,k); if (AT(prev_Ix,k)>d) d=AT(prev_Ix,k); if (AT(prev_Iy,k)>d) d=AT(prev_Iy,k);
+            AT(curr_M,k) = (d+s>0)?d+s:0;
             int ix = 0;
-            if (k+1<band) { int fm=prev_M[k+1]-gap_open-gap_extend, fi=prev_Ix[k+1]-gap_extend; ix=(fm>fi)?fm:fi; }
-            curr_Ix[k] = (ix>0)?ix:0;
+            if (k+1<band) { int fm=AT(prev_M,k+1)-gap_open-gap_extend, fi=AT(prev_Ix,k+1)-gap_extend; ix=(fm>fi)?fm:fi; }
+            AT(curr_Ix,k) = (ix>0)?ix:0;
         }
         for (int jj = js; jj <= je; jj++) {
             int k = jj-(diag+i)+band_width, iy = 0;
-            if (k>0) { int fm=curr_M[k-1]-gap_open-gap_extend, fi=curr_Iy[k-1]-gap_extend; iy=(fm>fi)?fm:fi; }
-            curr_Iy[k] = (iy>0)?iy:0;
+            if (k>0) { int fm=AT(curr_M,k-1)-gap_open-gap_extend, fi=AT(curr_Iy,k-1)-gap_extend; iy=(fm>fi)?fm:fi; }
+            AT(curr_Iy,k) = (iy>0)?iy:0;
         }
         for (int jj = js; jj <= je; jj++) {
             int k = jj-(diag+i)+band_width;
-            if (curr_M[k]>best) { best=curr_M[k]; best_i=i; best_j=jj; }
+            if (AT(curr_M,k)>best) { best=AT(curr_M,k); best_i=i; best_j=jj; }
         }
         for (int k = 0; k < band; k++) {
-            int t = prev_M[k]; prev_M[k]=curr_M[k]; curr_M[k]=t;
-            t = prev_Ix[k]; prev_Ix[k]=curr_Ix[k]; curr_Ix[k]=t;
-            t = prev_Iy[k]; prev_Iy[k]=curr_Iy[k]; curr_Iy[k]=t;
+            int t = AT(prev_M,k); AT(prev_M,k)=AT(curr_M,k); AT(curr_M,k)=t;
+            t = AT(prev_Ix,k); AT(prev_Ix,k)=AT(curr_Ix,k); AT(curr_Ix,k)=t;
+            t = AT(prev_Iy,k); AT(prev_Iy,k)=AT(curr_Iy,k); AT(curr_Iy,k)=t;
         }
     }
     scores[rid]=(float)best;
@@ -194,6 +208,7 @@ __global__ void sw_align_local(
     if (ref_start[rid] < 0) ref_start[rid] = 0;
     if (ref_end[rid] > ref_len) ref_end[rid] = ref_len;
 }
+#undef AT
 
 /* ── C-callable launchers ───────────────────────────────────── */
 extern "C" {
@@ -229,9 +244,34 @@ int launch_sw_align(
     int band_width, int gap_open, int gap_extend,
     float* scores, int* rs, int* re, int* fs, int* fe)
 {
-    int threads = 256;
+    int bw = band_width;
+    if (bw > MAX_BAND_WIDTH) bw = MAX_BAND_WIDTH;
+    if (bw < 0) bw = 0;
+    int band = 2 * bw + 1;
+    size_t bytes_per_thread = 6ULL * band * sizeof(int);
+
+    /* Query and opt into the device's real max shared memory per block
+       (default CUDA cap is 48KB; Blackwell/Hopper-class parts allow a
+       much larger opt-in limit — query it, don't assume a number). */
+    static int budget = 0;
+    static bool attr_set = false;
+    if (budget == 0) {
+        cudaDeviceGetAttribute(&budget, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+        if (budget <= 0) budget = 48 * 1024;
+    }
+
+    int threads = (int)(budget / bytes_per_thread);
+    if (threads > 256) threads = 256;
+    if (threads < 1) threads = 1;
+    size_t shmem_bytes = threads * bytes_per_thread;
+
+    if (!attr_set) {
+        cudaFuncSetAttribute(sw_align_local, cudaFuncAttributeMaxDynamicSharedMemorySize, budget);
+        attr_set = true;
+    }
+
     int blocks = (n_reads + threads - 1) / threads;
-    sw_align_local<<<blocks, threads>>>(
+    sw_align_local<<<blocks, threads, shmem_bytes>>>(
         reads, ref, ref_len, anchor_rp, anchor_fp,
         n_reads, read_len, band_width, gap_open, gap_extend,
         scores, rs, re, fs, fe);

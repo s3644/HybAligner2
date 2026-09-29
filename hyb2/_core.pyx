@@ -25,14 +25,23 @@ for c, v in [(65,0),(67,1),(71,2),(84,3),(97,0),(99,1),(103,2),(116,3),(78,3),(1
 
 cdef bytes pad_and_encode_stream(str fastq_path, int n_reads, int read_len):
     """Stream FASTQ → pad + 2-bit encode in ONE pass. No intermediate list.
-    Eliminates: 6GB read(), split(b'\\n'), 24M-item list extraction."""
+    Eliminates: 6GB read(), split(b'\\n'), 24M-item list extraction.
+
+    Each read is packed into its own byte-aligned block of rl_bytes =
+    (read_len+3)>>2 bytes (padded with 'A'=00 if read_len % 4 != 0). This
+    MUST match the per-read stride the GPU kernels use to index into the
+    packed reads buffer (`reads + rid * ((read_len+3)>>2)`); packing the
+    whole stream as one contiguous bitstream instead (ignoring per-read
+    boundaries) desyncs GPU indexing from the second read onward whenever
+    read_len isn't a multiple of 4 (e.g. 150bp, 250bp)."""
     cdef Py_ssize_t total = <Py_ssize_t>n_reads * <Py_ssize_t>read_len
-    cdef Py_ssize_t packed_total = (total + 3) >> 2
+    cdef int rl_bytes = (read_len + 3) >> 2
+    cdef Py_ssize_t packed_total = <Py_ssize_t>n_reads * <Py_ssize_t>rl_bytes
     cdef unsigned char* buf = <unsigned char*>malloc(total)
     cdef unsigned char* packed = <unsigned char*>malloc(packed_total)
     cdef unsigned char b0, b1, b2, b3
-    cdef int pos = 0, st = 0, rlen, i, reads_copied
-    cdef Py_ssize_t line_num
+    cdef int st = 0, rlen, reads_copied
+    cdef Py_ssize_t line_num, r, base_in_read, rbase, obase, i
     cdef bytes seq
 
     if buf == NULL or packed == NULL:
@@ -57,14 +66,18 @@ cdef bytes pad_and_encode_stream(str fastq_path, int n_reads, int read_len):
                 reads_copied += 1
             line_num += 1
 
-    # 2-bit encode
-    for i in range(0, total, 4):
-        b0 = _ENC_C[buf[i]]
-        b1 = _ENC_C[buf[i+1]] if i+1 < total else 0
-        b2 = _ENC_C[buf[i+2]] if i+2 < total else 0
-        b3 = _ENC_C[buf[i+3]] if i+3 < total else 0
-        packed[pos] = (b0 << 6) | (b1 << 4) | (b2 << 2) | b3
-        pos += 1
+    # 2-bit encode PER READ: each read gets its own byte-aligned block of
+    # rl_bytes bytes, matching the GPU kernels' `reads + rid * rl_bytes` stride.
+    for r in range(n_reads):
+        rbase = r * read_len
+        obase = r * rl_bytes
+        for base_in_read in range(0, read_len, 4):
+            i = rbase + base_in_read
+            b0 = _ENC_C[buf[i]]
+            b1 = _ENC_C[buf[i+1]] if base_in_read+1 < read_len else 0
+            b2 = _ENC_C[buf[i+2]] if base_in_read+2 < read_len else 0
+            b3 = _ENC_C[buf[i+3]] if base_in_read+3 < read_len else 0
+            packed[obase + (base_in_read >> 2)] = (b0 << 6) | (b1 << 4) | (b2 << 2) | b3
 
     cdef bytes result = packed[:packed_total]
     free(buf)
@@ -306,7 +319,8 @@ cdef class HybAligner2:
 
         # ── Stream encode (no intermediate list) ────────────
         padded_packed = pad_and_encode_stream(fastq_path, n_reads, read_len)
-        cdef int plen = ((<Py_ssize_t>n_reads * <Py_ssize_t>read_len + 3) >> 2)
+        # Must match pad_and_encode_stream's per-read byte-aligned stride.
+        cdef int plen = n_reads * ((read_len + 3) >> 2)
 
         # ── Upload packed reads to GPU ─────────────────────
         err = cudaMalloc(<void**>&d_reads, plen)
